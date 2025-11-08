@@ -1,0 +1,48 @@
+############################################
+#
+# Script for Siril 1.0
+# July 2020
+# (C) Cyril Richard
+# Preprocessing_WithoutDark v1.1
+#
+########### PREPROCESSING SCRIPT ###########
+#
+# Script for color camera preprocessing
+#
+# Needs 3 sets of RAW images in the working
+# directory, within 4 directories:
+#   flats/
+#   lights/
+#
+############################################
+
+requires 1.2.0
+
+# Convert Flat Frames to .fit files
+cd flats
+convert flat -out=../process
+cd ../process
+
+# Pre-process Flat Frames
+calibrate flat -bias=bias_stacked
+
+# Stack Flat Frames to pp_flat_stacked.fit
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+
+# Convert Light Frames to .fit files
+cd lights
+convert light -out=../process
+cd ../process
+
+# Pre-process Light Frames
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+
+# Align lights
+register pp_light
+
+# Stack calibrated lights to result.fit
+stack r_pp_light rej 3 3 -norm=addscale -output_norm -out=../result
+
+cd ..
+close
