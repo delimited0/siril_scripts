@@ -1,0 +1,207 @@
+############################################
+######### MULTI-NIGHT STACKING SCRIPT ######
+#
+# Script for multi-night image stacking
+# - Auto-detects set1, set2, set3, etc. folders
+# - Calibrates each set individually with synthetic bias
+# - Combines all calibrated lights into single sequence
+# - Registers and stacks all nights together
+#
+# Directory structure expected:
+#   set1/
+#     flats/
+#     lights/
+#   set2/
+#     flats/
+#     lights/
+#   set3/
+#     flats/
+#     lights/
+#   ... (auto-detected)
+#
+# Synthetic bias appropriate for Player One Poseidon C Pro
+# Uses symbolic links to combine sequences
+# Preserves all intermediate files
+#
+############################################
+
+requires 1.2.0
+
+# Store original working directory
+set original_wd $CWD$
+
+# Create directory for combined sequence
+mkdir -p multi_night_combined
+
+# Process each set folder (auto-detect set1, set2, set3, etc.)
+# Note: Siril scripting doesn't have loops, so we'll process up to 10 sets
+# Sets that don't exist will be skipped automatically
+
+# Process set1
+cd set1
+cd flats
+convert flat -out=../process
+cd ../process
+calibrate flat
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+cd lights
+convert light -out=../process
+cd ../process
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+cd $original_wd$
+
+# Process set2
+cd set2
+cd flats
+convert flat -out=../process
+cd ../process
+calibrate flat
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+cd lights
+convert light -out=../process
+cd ../process
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+cd $original_wd$
+
+# Process set3
+cd set3
+cd flats
+convert flat -out=../process
+cd ../process
+calibrate flat
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+cd lights
+convert light -out=../process
+cd ../process
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+cd $original_wd$
+
+# Process set4
+cd set4
+cd flats
+convert flat -out=../process
+cd ../process
+calibrate flat
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+cd lights
+convert light -out=../process
+cd ../process
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+cd $original_wd$
+
+# Process set5
+cd set5
+cd flats
+convert flat -out=../process
+cd ../process
+calibrate flat
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+cd lights
+convert light -out=../process
+cd ../process
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+cd $original_wd$
+
+# Process set6
+cd set6
+cd flats
+convert flat -out=../process
+cd ../process
+calibrate flat
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+cd lights
+convert light -out=../process
+cd ../process
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+cd $original_wd$
+
+# Process set7
+cd set7
+cd flats
+convert flat -out=../process
+cd ../process
+calibrate flat
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+cd lights
+convert light -out=../process
+cd ../process
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+cd $original_wd$
+
+# Process set8
+cd set8
+cd flats
+convert flat -out=../process
+cd ../process
+calibrate flat
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+cd lights
+convert light -out=../process
+cd ../process
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+cd $original_wd$
+
+# Process set9
+cd set9
+cd flats
+convert flat -out=../process
+cd ../process
+calibrate flat
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+cd lights
+convert light -out=../process
+cd ../process
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+cd $original_wd$
+
+# Process set10
+cd set10
+cd flats
+convert flat -out=../process
+cd ../process
+calibrate flat
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+cd lights
+convert light -out=../process
+cd ../process
+calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+cd $original_wd$
+
+# Now combine all calibrated lights into a single sequence using symbolic links
+cd multi_night_combined
+
+# Convert with symbolic links to create unified sequence
+# Add pp_light files from each set
+convert -link set1/process/pp_light -out=.
+convert -link set2/process/pp_light -out=.
+convert -link set3/process/pp_light -out=.
+convert -link set4/process/pp_light -out=.
+convert -link set5/process/pp_light -out=.
+convert -link set6/process/pp_light -out=.
+convert -link set7/process/pp_light -out=.
+convert -link set8/process/pp_light -out=.
+convert -link set9/process/pp_light -out=.
+convert -link set10/process/pp_light -out=.
+
+# Load the combined sequence
+# Siril will automatically detect pp_light_*.fit files
+
+# Register all frames from all nights
+register pp_light
+
+# Stack with sigma clipping rejection (sigma=3)
+# Use additive scaling normalization, output normalization, and RGB equalization
+stack r_pp_light rej 3 3 -norm=addscale -output_norm -rgb_equal -out=../multi_night_result
+
+cd ..
+close

@@ -34,11 +34,5 @@ cd ../process
 # Pre-process Light Frames
 calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
 
-# Align lights
-register pp_light
-
-# Stack calibrated lights to result.fit
-stack r_pp_light rej 3 3 -norm=addscale -output_norm -out=../result
-
 cd ..
 close

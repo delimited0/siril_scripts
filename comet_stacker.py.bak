@@ -1,0 +1,1129 @@
+#!/usr/bin/env python3
+"""
+Comet Stacking GUI for Siril
+
+A comprehensive GUI application for automated comet image stacking using Siril.
+Supports synthetic bias calibration (no dark frames required) and OSC cameras.
+
+Features:
+- Synthetic bias calibration with configurable coefficient
+- Flat field correction
+- Dual registration: star-aligned and comet-aligned stacking
+- Embedded FITS frame viewer for comet selection
+- Optional background extraction
+- Optional StarNet++ star removal
+- Animation/timelapse generation with FFmpeg
+- Batch processing support
+- Preset system for camera configurations
+
+Requirements:
+- pysiril
+- PyQt5
+- numpy
+- astropy
+- matplotlib
+- pillow
+
+License: MIT
+Copyright (c) 2025
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+import sys
+import os
+import json
+import subprocess
+import shutil
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Tuple, List
+
+import numpy as np
+from astropy.io import fits
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTabWidget, QPushButton, QLabel, QLineEdit, QSpinBox, QDoubleSpinBox,
+    QCheckBox, QComboBox, QTextEdit, QFileDialog, QGroupBox, QGridLayout,
+    QMessageBox, QProgressBar, QScrollArea, QFrame, QSplitter
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint, QRect
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
+from PIL import Image
+
+try:
+    import sirilpy
+    from sirilpy import LogColor
+    SIRILPY_AVAILABLE = True
+except ImportError:
+    SIRILPY_AVAILABLE = False
+
+
+class FITSViewer(QWidget):
+    """Custom widget for displaying FITS images with selection box capability."""
+    
+    selection_changed = pyqtSignal(QRect)  # Emits selection rectangle
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.image_data = None
+        self.pixmap = None
+        self.selection_start = None
+        self.selection_rect = QRect()
+        self.is_selecting = False
+        self.scale_factor = 1.0
+        
+        self.setMinimumSize(400, 400)
+        self.setMouseTracking(True)
+        
+    def load_fits(self, fits_path: str, downsample: int = 4):
+        """Load and display a FITS file with downsampling."""
+        try:
+            with fits.open(fits_path) as hdul:
+                data = hdul[0].data
+                
+                # Handle color images (3D arrays)
+                if len(data.shape) == 3:
+                    # Assume CFA or RGB format, take one channel or convert
+                    if data.shape[0] == 3:  # RGB format
+                        data = np.mean(data, axis=0)
+                    else:
+                        data = data[0]  # Take first channel
+                
+                # Downsample
+                if downsample > 1:
+                    data = data[::downsample, ::downsample]
+                
+                self.image_data = data
+                self.scale_factor = downsample
+                
+                # Normalize to 0-255 for display
+                data_min = np.percentile(data, 1)
+                data_max = np.percentile(data, 99)
+                data_normalized = np.clip((data - data_min) / (data_max - data_min) * 255, 0, 255).astype(np.uint8)
+                
+                # Convert to QPixmap
+                height, width = data_normalized.shape
+                bytes_per_line = width
+                q_image = QImage(data_normalized.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
+                self.pixmap = QPixmap.fromImage(q_image)
+                
+                self.update()
+                return True
+                
+        except Exception as e:
+            print(f"Error loading FITS: {e}")
+            return False
+    
+    def clear_selection(self):
+        """Clear the current selection box."""
+        self.selection_rect = QRect()
+        self.update()
+    
+    def get_selection_coords(self) -> Optional[Tuple[int, int, int, int]]:
+        """Get selection coordinates scaled back to original image size."""
+        if self.selection_rect.isNull():
+            return None
+        
+        x = int(self.selection_rect.x() * self.scale_factor)
+        y = int(self.selection_rect.y() * self.scale_factor)
+        w = int(self.selection_rect.width() * self.scale_factor)
+        h = int(self.selection_rect.height() * self.scale_factor)
+        
+        return (x, y, w, h)
+    
+    def paintEvent(self, event):
+        """Draw the image and selection box."""
+        painter = QPainter(self)
+        
+        if self.pixmap:
+            # Draw image centered
+            x = (self.width() - self.pixmap.width()) // 2
+            y = (self.height() - self.pixmap.height()) // 2
+            painter.drawPixmap(x, y, self.pixmap)
+            
+            # Draw selection box
+            if not self.selection_rect.isNull():
+                painter.setPen(QPen(QColor(0, 255, 0), 2, Qt.SolidLine))
+                adjusted_rect = self.selection_rect.translated(x, y)
+                painter.drawRect(adjusted_rect)
+        else:
+            painter.drawText(self.rect(), Qt.AlignCenter, "No image loaded")
+    
+    def mousePressEvent(self, event):
+        """Start selection box."""
+        if event.button() == Qt.LeftButton and self.pixmap:
+            # Convert to image coordinates
+            x_offset = (self.width() - self.pixmap.width()) // 2
+            y_offset = (self.height() - self.pixmap.height()) // 2
+            
+            pos = event.pos() - QPoint(x_offset, y_offset)
+            
+            if 0 <= pos.x() < self.pixmap.width() and 0 <= pos.y() < self.pixmap.height():
+                self.selection_start = pos
+                self.selection_rect = QRect(pos, pos)
+                self.is_selecting = True
+    
+    def mouseMoveEvent(self, event):
+        """Update selection box while dragging."""
+        if self.is_selecting and self.selection_start:
+            x_offset = (self.width() - self.pixmap.width()) // 2
+            y_offset = (self.height() - self.pixmap.height()) // 2
+            
+            pos = event.pos() - QPoint(x_offset, y_offset)
+            
+            # Clamp to image bounds
+            pos.setX(max(0, min(pos.x(), self.pixmap.width() - 1)))
+            pos.setY(max(0, min(pos.y(), self.pixmap.height() - 1)))
+            
+            self.selection_rect = QRect(self.selection_start, pos).normalized()
+            self.update()
+    
+    def mouseReleaseEvent(self, event):
+        """Finish selection box."""
+        if event.button() == Qt.LeftButton and self.is_selecting:
+            self.is_selecting = False
+            if not self.selection_rect.isNull():
+                self.selection_changed.emit(self.selection_rect)
+
+
+class SirilWorker(QThread):
+    """Worker thread for running Siril commands."""
+    
+    log_message = pyqtSignal(str, str)  # message, color
+    progress_update = pyqtSignal(int)  # percentage
+    finished = pyqtSignal(bool, str)  # success, message
+    
+    def __init__(self, task_func, *args, **kwargs):
+        super().__init__()
+        self.task_func = task_func
+        self.args = args
+        self.kwargs = kwargs
+        self.siril = None
+    
+    def run(self):
+        """Execute the task function."""
+        try:
+            result = self.task_func(self, *self.args, **self.kwargs)
+            if result is None or result:
+                self.finished.emit(True, "Task completed successfully")
+            else:
+                self.finished.emit(False, "Task completed with errors")
+        except Exception as e:
+            self.log_message.emit(f"Error: {str(e)}", "red")
+            self.finished.emit(False, str(e))
+    
+    def cmd(self, *args):
+        """Execute Siril command with logging."""
+        cmd_str = " ".join(str(arg) for arg in args)
+        self.log_message.emit(f"$ {cmd_str}", "blue")
+        try:
+            if self.siril:
+                self.siril.cmd(*args)
+        except Exception as e:
+            self.log_message.emit(f"Command failed: {e}", "red")
+            raise
+
+
+class CometStackerGUI(QMainWindow):
+    """Main application window."""
+    
+    def __init__(self, siril_instance=None):
+        super().__init__()
+        self.siril = siril_instance
+        self.working_dir = None
+        self.worker = None
+        
+        self.init_ui()
+        self.load_settings()
+        
+        # Auto-populate working directory from Siril
+        if self.siril:
+            try:
+                wd = self.siril.get_siril_wd()
+                if wd and Path(wd).exists():
+                    self.working_dir = wd
+                    self.dir_label.setText(wd)
+                    self.start_button.setEnabled(True)
+                    self.log(f"Working directory auto-detected: {wd}", "green")
+                    
+                    # Create required subdirectories
+                    for subdir in ["process", "masters", "final_stack", "timelapse_images"]:
+                        (Path(wd) / subdir).mkdir(exist_ok=True)
+            except Exception as e:
+                self.log(f"Could not auto-detect working directory: {e}", "salmon")
+    
+    def init_ui(self):
+        """Initialize the user interface."""
+        self.setWindowTitle("Comet Stacking GUI for Siril")
+        self.setGeometry(100, 100, 1400, 900)
+        
+        # Central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        main_layout = QHBoxLayout(central_widget)
+        
+        # Left panel: controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_panel.setMaximumWidth(500)
+        
+        # Directory selection
+        dir_group = QGroupBox("Working Directory")
+        dir_layout = QVBoxLayout()
+        
+        dir_select_layout = QHBoxLayout()
+        self.dir_label = QLabel("No directory selected")
+        self.dir_label.setWordWrap(True)
+        dir_button = QPushButton("Select Directory")
+        dir_button.clicked.connect(self.select_directory)
+        dir_select_layout.addWidget(self.dir_label, 1)
+        dir_select_layout.addWidget(dir_button)
+        dir_layout.addLayout(dir_select_layout)
+        
+        dir_group.setLayout(dir_layout)
+        left_layout.addWidget(dir_group)
+        
+        # Calibration settings
+        calib_group = QGroupBox("Calibration Settings")
+        calib_layout = QGridLayout()
+        
+        calib_layout.addWidget(QLabel("Synthetic Bias Coefficient:"), 0, 0)
+        self.bias_coeff_spin = QDoubleSpinBox()
+        self.bias_coeff_spin.setRange(0, 100)
+        self.bias_coeff_spin.setValue(8)
+        self.bias_coeff_spin.setDecimals(1)
+        self.bias_coeff_spin.setToolTip("Multiplier for OFFSET value (e.g., 8 for Poseidon C Pro)")
+        calib_layout.addWidget(self.bias_coeff_spin, 0, 1)
+        
+        self.use_flats_check = QCheckBox("Use Flat Frames")
+        self.use_flats_check.setChecked(True)
+        calib_layout.addWidget(self.use_flats_check, 1, 0, 1, 2)
+        
+        self.background_extract_check = QCheckBox("Background Extraction")
+        self.background_extract_check.setChecked(False)
+        calib_layout.addWidget(self.background_extract_check, 2, 0, 1, 2)
+        
+        calib_group.setLayout(calib_layout)
+        left_layout.addWidget(calib_group)
+        
+        # Registration & Filtering
+        reg_group = QGroupBox("Registration & Filtering")
+        reg_layout = QGridLayout()
+        
+        self.filter_round_check = QCheckBox("Roundness Filter (σ):")
+        reg_layout.addWidget(self.filter_round_check, 0, 0)
+        self.filter_round_spin = QDoubleSpinBox()
+        self.filter_round_spin.setRange(0.1, 5.0)
+        self.filter_round_spin.setValue(3.0)
+        self.filter_round_spin.setDecimals(1)
+        reg_layout.addWidget(self.filter_round_spin, 0, 1)
+        
+        self.filter_fwhm_check = QCheckBox("FWHM Filter (σ):")
+        reg_layout.addWidget(self.filter_fwhm_check, 1, 0)
+        self.filter_fwhm_spin = QDoubleSpinBox()
+        self.filter_fwhm_spin.setRange(0.1, 5.0)
+        self.filter_fwhm_spin.setValue(3.0)
+        self.filter_fwhm_spin.setDecimals(1)
+        reg_layout.addWidget(self.filter_fwhm_spin, 1, 1)
+        
+        reg_group.setLayout(reg_layout)
+        left_layout.addWidget(reg_group)
+        
+        # Stacking settings
+        stack_group = QGroupBox("Stacking Settings")
+        stack_layout = QGridLayout()
+        
+        stack_layout.addWidget(QLabel("Rejection Algorithm:"), 0, 0)
+        self.rejection_combo = QComboBox()
+        self.rejection_combo.addItems(["winsorized", "sigmedian", "median", "linear", "none"])
+        self.rejection_combo.setCurrentText("winsorized")
+        stack_layout.addWidget(self.rejection_combo, 0, 1)
+        
+        stack_layout.addWidget(QLabel("Star Stack Sigma High:"), 1, 0)
+        self.star_sigma_high_spin = QDoubleSpinBox()
+        self.star_sigma_high_spin.setRange(0.1, 10.0)
+        self.star_sigma_high_spin.setValue(3.0)
+        self.star_sigma_high_spin.setDecimals(1)
+        stack_layout.addWidget(self.star_sigma_high_spin, 1, 1)
+        
+        stack_layout.addWidget(QLabel("Star Stack Sigma Low:"), 2, 0)
+        self.star_sigma_low_spin = QDoubleSpinBox()
+        self.star_sigma_low_spin.setRange(0.1, 10.0)
+        self.star_sigma_low_spin.setValue(3.0)
+        self.star_sigma_low_spin.setDecimals(1)
+        stack_layout.addWidget(self.star_sigma_low_spin, 2, 1)
+        
+        stack_layout.addWidget(QLabel("Comet Stack Sigma High:"), 3, 0)
+        self.comet_sigma_high_spin = QDoubleSpinBox()
+        self.comet_sigma_high_spin.setRange(0.1, 10.0)
+        self.comet_sigma_high_spin.setValue(3.0)
+        self.comet_sigma_high_spin.setDecimals(1)
+        stack_layout.addWidget(self.comet_sigma_high_spin, 3, 1)
+        
+        stack_layout.addWidget(QLabel("Comet Stack Sigma Low:"), 4, 0)
+        self.comet_sigma_low_spin = QDoubleSpinBox()
+        self.comet_sigma_low_spin.setRange(0.1, 10.0)
+        self.comet_sigma_low_spin.setValue(3.0)
+        self.comet_sigma_low_spin.setDecimals(1)
+        stack_layout.addWidget(self.comet_sigma_low_spin, 4, 1)
+        
+        stack_group.setLayout(stack_layout)
+        left_layout.addWidget(stack_group)
+        
+        # Enhancement options
+        enhance_group = QGroupBox("Enhancement Options")
+        enhance_layout = QVBoxLayout()
+        
+        self.starnet_check = QCheckBox("StarNet++ Star Removal")
+        self.starnet_check.setChecked(False)
+        enhance_layout.addWidget(self.starnet_check)
+        
+        self.create_animation_check = QCheckBox("Create Animation/Timelapse")
+        self.create_animation_check.setChecked(False)
+        enhance_layout.addWidget(self.create_animation_check)
+        
+        anim_settings = QGridLayout()
+        anim_settings.addWidget(QLabel("FPS:"), 0, 0)
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(1, 60)
+        self.fps_spin.setValue(24)
+        anim_settings.addWidget(self.fps_spin, 0, 1)
+        
+        anim_settings.addWidget(QLabel("Quality (CRF):"), 1, 0)
+        self.crf_spin = QSpinBox()
+        self.crf_spin.setRange(0, 51)
+        self.crf_spin.setValue(23)
+        self.crf_spin.setToolTip("0=lossless, 23=default, 51=worst")
+        anim_settings.addWidget(self.crf_spin, 1, 1)
+        
+        enhance_layout.addLayout(anim_settings)
+        enhance_group.setLayout(enhance_layout)
+        left_layout.addWidget(enhance_group)
+        
+        # Preset buttons
+        preset_layout = QHBoxLayout()
+        save_preset_btn = QPushButton("Save Preset")
+        save_preset_btn.clicked.connect(self.save_preset)
+        load_preset_btn = QPushButton("Load Preset")
+        load_preset_btn.clicked.connect(self.load_preset)
+        preset_layout.addWidget(save_preset_btn)
+        preset_layout.addWidget(load_preset_btn)
+        left_layout.addLayout(preset_layout)
+        
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        left_layout.addWidget(self.progress_bar)
+        
+        # Action buttons
+        self.start_button = QPushButton("Start Processing")
+        self.start_button.clicked.connect(self.start_processing)
+        self.start_button.setEnabled(False)
+        left_layout.addWidget(self.start_button)
+        
+        left_layout.addStretch()
+        
+        # Right panel: tabs
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        self.tabs = QTabWidget()
+        
+        # Log tab
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Monospace", 9))
+        self.tabs.addTab(self.log_text, "Log")
+        
+        # Comet selection tab
+        comet_select_widget = QWidget()
+        comet_select_layout = QVBoxLayout(comet_select_widget)
+        
+        # Instructions
+        instructions = QLabel(
+            "1. Run calibration and star registration first\n"
+            "2. Select first frame for comet trajectory\n"
+            "3. Draw box around comet in first frame\n"
+            "4. Select last frame for comet trajectory\n"
+            "5. Draw box around comet in last frame\n"
+            "6. Click 'Register Comet' to complete registration"
+        )
+        instructions.setWordWrap(True)
+        comet_select_layout.addWidget(instructions)
+        
+        # Frame selection
+        frame_select_layout = QHBoxLayout()
+        frame_select_layout.addWidget(QLabel("First Frame:"))
+        self.first_frame_spin = QSpinBox()
+        self.first_frame_spin.setRange(0, 9999)
+        self.first_frame_spin.setValue(0)
+        frame_select_layout.addWidget(self.first_frame_spin)
+        
+        load_first_btn = QPushButton("Load First")
+        load_first_btn.clicked.connect(lambda: self.load_comet_frame(True))
+        frame_select_layout.addWidget(load_first_btn)
+        
+        frame_select_layout.addWidget(QLabel("Last Frame:"))
+        self.last_frame_spin = QSpinBox()
+        self.last_frame_spin.setRange(0, 9999)
+        self.last_frame_spin.setValue(0)
+        frame_select_layout.addWidget(self.last_frame_spin)
+        
+        load_last_btn = QPushButton("Load Last")
+        load_last_btn.clicked.connect(lambda: self.load_comet_frame(False))
+        frame_select_layout.addWidget(load_last_btn)
+        
+        comet_select_layout.addLayout(frame_select_layout)
+        
+        # Viewers for first and last frames
+        viewers_layout = QHBoxLayout()
+        
+        first_frame_group = QGroupBox("First Frame")
+        first_frame_layout = QVBoxLayout()
+        self.first_frame_viewer = FITSViewer()
+        self.first_frame_viewer.selection_changed.connect(self.on_first_frame_selection)
+        first_frame_layout.addWidget(self.first_frame_viewer)
+        self.first_coords_label = QLabel("No selection")
+        first_frame_layout.addWidget(self.first_coords_label)
+        first_frame_group.setLayout(first_frame_layout)
+        viewers_layout.addWidget(first_frame_group)
+        
+        last_frame_group = QGroupBox("Last Frame")
+        last_frame_layout = QVBoxLayout()
+        self.last_frame_viewer = FITSViewer()
+        self.last_frame_viewer.selection_changed.connect(self.on_last_frame_selection)
+        last_frame_layout.addWidget(self.last_frame_viewer)
+        self.last_coords_label = QLabel("No selection")
+        last_frame_layout.addWidget(self.last_coords_label)
+        last_frame_group.setLayout(last_frame_layout)
+        viewers_layout.addWidget(last_frame_group)
+        
+        comet_select_layout.addLayout(viewers_layout)
+        
+        # Register button
+        self.register_comet_btn = QPushButton("Register Comet")
+        self.register_comet_btn.clicked.connect(self.register_comet)
+        self.register_comet_btn.setEnabled(False)
+        comet_select_layout.addWidget(self.register_comet_btn)
+        
+        self.tabs.addTab(comet_select_widget, "Comet Selection")
+        
+        right_layout.addWidget(self.tabs)
+        
+        # Add panels to main layout
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        
+        main_layout.addWidget(splitter)
+        
+        self.log("Comet Stacker GUI initialized", "green")
+        
+        if not SIRILPY_AVAILABLE:
+            self.log("WARNING: sirilpy not available. Siril integration will not work.", "red")
+    
+    def log(self, message: str, color: str = "black"):
+        """Add message to log with color."""
+        color_map = {
+            "black": "#000000",
+            "red": "#FF0000",
+            "green": "#00AA00",
+            "blue": "#0000FF",
+            "salmon": "#FA8072",
+        }
+        
+        hex_color = color_map.get(color, color_map["black"])
+        self.log_text.append(f'<span style="color: {hex_color};">{message}</span>')
+    
+    def select_directory(self):
+        """Select working directory."""
+        directory = QFileDialog.getExistingDirectory(self, "Select Working Directory")
+        
+        if directory:
+            # Validate directory structure
+            lights_dir = Path(directory) / "lights"
+            flats_dir = Path(directory) / "flats"
+            
+            if not lights_dir.exists():
+                QMessageBox.warning(self, "Invalid Directory", 
+                                    "Selected directory must contain a 'lights' subfolder.")
+                return
+            
+            if self.use_flats_check.isChecked() and not flats_dir.exists():
+                reply = QMessageBox.question(
+                    self, "Missing Flats",
+                    "No 'flats' folder found. Continue without flats?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    return
+                self.use_flats_check.setChecked(False)
+            
+            self.working_dir = directory
+            self.dir_label.setText(directory)
+            self.start_button.setEnabled(True)
+            
+            # Create required subdirectories
+            for subdir in ["process", "masters", "final_stack", "timelapse_images"]:
+                (Path(directory) / subdir).mkdir(exist_ok=True)
+            
+            self.log(f"Working directory set: {directory}", "green")
+    
+    def on_first_frame_selection(self, rect):
+        """Handle first frame comet selection."""
+        coords = self.first_frame_viewer.get_selection_coords()
+        if coords:
+            self.first_coords_label.setText(f"Selection: x={coords[0]}, y={coords[1]}, w={coords[2]}, h={coords[3]}")
+            self.update_register_button()
+    
+    def on_last_frame_selection(self, rect):
+        """Handle last frame comet selection."""
+        coords = self.last_frame_viewer.get_selection_coords()
+        if coords:
+            self.last_coords_label.setText(f"Selection: x={coords[0]}, y={coords[1]}, w={coords[2]}, h={coords[3]}")
+            self.update_register_button()
+    
+    def update_register_button(self):
+        """Enable register button if both frames have selections."""
+        first_coords = self.first_frame_viewer.get_selection_coords()
+        last_coords = self.last_frame_viewer.get_selection_coords()
+        self.register_comet_btn.setEnabled(first_coords is not None and last_coords is not None)
+    
+    def load_comet_frame(self, is_first: bool):
+        """Load a frame for comet selection."""
+        if not self.working_dir:
+            return
+        
+        frame_num = self.first_frame_spin.value() if is_first else self.last_frame_spin.value()
+        
+        # Determine sequence name based on processing stage
+        process_dir = Path(self.working_dir) / "process"
+        
+        # Look for registered sequence
+        if self.background_extract_check.isChecked():
+            seq_name = f"r_bkg_pp_light_{frame_num:05d}.fit"
+        else:
+            seq_name = f"r_pp_light_{frame_num:05d}.fit"
+        
+        fits_path = process_dir / seq_name
+        
+        if not fits_path.exists():
+            # Try without registration prefix
+            if self.background_extract_check.isChecked():
+                seq_name = f"bkg_pp_light_{frame_num:05d}.fit"
+            else:
+                seq_name = f"pp_light_{frame_num:05d}.fit"
+            
+            fits_path = process_dir / seq_name
+        
+        if not fits_path.exists():
+            QMessageBox.warning(self, "Frame Not Found",
+                                f"Frame {frame_num} not found. Run preprocessing first.")
+            return
+        
+        viewer = self.first_frame_viewer if is_first else self.last_frame_viewer
+        viewer.clear_selection()
+        
+        if viewer.load_fits(str(fits_path), downsample=4):
+            self.log(f"Loaded frame {frame_num} for comet selection", "green")
+        else:
+            QMessageBox.warning(self, "Load Error", f"Failed to load frame {frame_num}")
+    
+    def register_comet(self):
+        """Register comet using Siril GUI automation."""
+        first_coords = self.first_frame_viewer.get_selection_coords()
+        last_coords = self.last_frame_viewer.get_selection_coords()
+        
+        if not first_coords or not last_coords:
+            return
+        
+        # Calculate center points of selections
+        first_x = first_coords[0] + first_coords[2] // 2
+        first_y = first_coords[1] + first_coords[3] // 2
+        last_x = last_coords[0] + last_coords[2] // 2
+        last_y = last_coords[1] + last_coords[3] // 2
+        
+        self.log(f"Comet position in first frame: ({first_x}, {first_y})", "blue")
+        self.log(f"Comet position in last frame: ({last_x}, {last_y})", "blue")
+        
+        # Calculate velocity
+        num_frames = self.last_frame_spin.value() - self.first_frame_spin.value()
+        if num_frames > 0:
+            vel_x = (last_x - first_x) / num_frames
+            vel_y = (last_y - first_y) / num_frames
+            self.log(f"Calculated velocity: ({vel_x:.2f}, {vel_y:.2f}) pixels/frame", "blue")
+        
+        # Show instructions for manual Siril registration
+        instructions = (
+            f"Comet coordinates calculated:\n\n"
+            f"First frame ({self.first_frame_spin.value()}): ({first_x}, {first_y})\n"
+            f"Last frame ({self.last_frame_spin.value()}): ({last_x}, {last_y})\n\n"
+            f"Please complete comet registration in Siril:\n"
+            f"1. Open Siril if not already running\n"
+            f"2. Load the registered sequence in the working directory\n"
+            f"3. Go to Registration tab → Comet/Asteroid Registration\n"
+            f"4. Use the coordinates above to mark the comet\n"
+            f"5. Click Register\n"
+            f"6. Return here and continue with comet stacking"
+        )
+        
+        QMessageBox.information(self, "Complete Registration in Siril", instructions)
+        
+        self.log("Ready for comet stacking after manual registration", "green")
+    
+    def start_processing(self):
+        """Start the full processing workflow."""
+        if not self.working_dir:
+            QMessageBox.warning(self, "No Directory", "Please select a working directory first.")
+            return
+        
+        if not SIRILPY_AVAILABLE:
+            QMessageBox.critical(self, "Missing Dependency", 
+                                 "sirilpy is not available. This script must be run from Siril.")
+            return
+        
+        self.start_button.setEnabled(False)
+        self.progress_bar.setValue(0)
+        
+        # Start worker thread
+        self.worker = SirilWorker(self.process_workflow)
+        self.worker.log_message.connect(self.log)
+        self.worker.progress_update.connect(self.progress_bar.setValue)
+        self.worker.finished.connect(self.on_processing_finished)
+        self.worker.start()
+    
+    def process_workflow(self, worker: SirilWorker):
+        """Main processing workflow executed in worker thread."""
+        try:
+            # Use the Siril instance passed to the GUI
+            worker.log_message.emit("Using Siril instance...", "blue")
+            worker.siril = self.siril
+            
+            # Change to working directory
+            worker.cmd("cd", self.working_dir)
+            worker.progress_update.emit(5)
+            
+            # Process flats
+            if self.use_flats_check.isChecked():
+                worker.log_message.emit("=== Processing Flat Frames ===", "green")
+                self.process_flats(worker)
+                worker.progress_update.emit(20)
+            
+            # Process lights
+            worker.log_message.emit("=== Processing Light Frames ===", "green")
+            self.process_lights(worker)
+            worker.progress_update.emit(40)
+            
+            # Background extraction
+            if self.background_extract_check.isChecked():
+                worker.log_message.emit("=== Extracting Background ===", "green")
+                self.extract_background(worker)
+                worker.progress_update.emit(50)
+            
+            # Star registration
+            worker.log_message.emit("=== Registering on Stars ===", "green")
+            self.register_stars(worker)
+            worker.progress_update.emit(60)
+            
+            # Star-aligned stack
+            worker.log_message.emit("=== Stacking on Stars ===", "green")
+            self.stack_stars(worker)
+            worker.progress_update.emit(70)
+            
+            # Note about comet registration
+            worker.log_message.emit("", "black")
+            worker.log_message.emit("=== Manual Step Required ===", "salmon")
+            worker.log_message.emit("Go to 'Comet Selection' tab to complete comet registration", "salmon")
+            worker.log_message.emit("Then run comet stacking separately", "salmon")
+            
+            worker.progress_update.emit(80)
+            
+            # StarNet if enabled
+            if self.starnet_check.isChecked():
+                worker.log_message.emit("=== Applying StarNet++ ===", "green")
+                self.apply_starnet(worker)
+                worker.progress_update.emit(90)
+            
+            # Animation if enabled
+            if self.create_animation_check.isChecked():
+                worker.log_message.emit("=== Creating Animation ===", "green")
+                self.create_animation(worker)
+                worker.progress_update.emit(95)
+            
+            worker.progress_update.emit(100)
+            worker.log_message.emit("Processing complete!", "green")
+            
+            # Close Siril
+            worker.cmd("close")
+            
+        except Exception as e:
+            worker.log_message.emit(f"Error in workflow: {e}", "red")
+            raise
+    
+    def process_flats(self, worker: SirilWorker):
+        """Process flat frames."""
+        worker.cmd("cd", "flats")
+        worker.cmd("convert", "flat", "-out=../process")
+        worker.cmd("cd", "../process")
+        worker.cmd("calibrate", "flat")
+        worker.cmd("stack", "pp_flat", "rej", "3", "3", "-norm=mul")
+        
+        # Copy master flat to masters directory
+        src = Path(self.working_dir) / "process" / "pp_flat_stacked.fit"
+        dst = Path(self.working_dir) / "masters" / "pp_flat_stacked.fit"
+        if src.exists():
+            shutil.copy(src, dst)
+            worker.log_message.emit(f"Master flat saved to {dst}", "green")
+        
+        worker.cmd("cd", "..")
+    
+    def process_lights(self, worker: SirilWorker):
+        """Process light frames."""
+        worker.cmd("cd", "lights")
+        worker.cmd("convert", "light", "-out=../process")
+        worker.cmd("cd", "../process")
+        
+        # Build calibration command
+        bias_formula = f"={self.bias_coeff_spin.value()}*$OFFSET"
+        
+        if self.use_flats_check.isChecked():
+            worker.cmd("calibrate", "light", f"-bias=\"{bias_formula}\"", 
+                       "-flat=pp_flat_stacked", "-cfa", "-equalize_cfa", "-debayer")
+        else:
+            worker.cmd("calibrate", "light", f"-bias=\"{bias_formula}\"", 
+                       "-cfa", "-equalize_cfa", "-debayer")
+        
+        worker.cmd("cd", "..")
+    
+    def extract_background(self, worker: SirilWorker):
+        """Extract background from calibrated lights."""
+        worker.cmd("cd", "process")
+        worker.cmd("seqsubsky", "pp_light", "1", "-samples=10")
+        worker.cmd("cd", "..")
+    
+    def register_stars(self, worker: SirilWorker):
+        """Register frames on stars."""
+        worker.cmd("cd", "process")
+        
+        seq_name = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+        worker.cmd("register", seq_name)
+        
+        # Apply registration with filters if enabled
+        filter_args = []
+        if self.filter_round_check.isChecked():
+            filter_args.append(f"-filter-round={self.filter_round_spin.value()}k")
+        if self.filter_fwhm_check.isChecked():
+            filter_args.append(f"-filter-wfwhm={self.filter_fwhm_spin.value()}k")
+        
+        if filter_args:
+            worker.cmd("seqapplyreg", f"r_{seq_name}", "-kernel=square", 
+                       "-framing=current", *filter_args)
+        
+        worker.cmd("cd", "..")
+    
+    def stack_stars(self, worker: SirilWorker):
+        """Stack frames aligned on stars."""
+        worker.cmd("cd", "process")
+        
+        seq_name = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+        rejection = self.rejection_combo.currentText()
+        
+        if rejection == "none":
+            stack_cmd = f"stack r_{seq_name} rej none"
+        else:
+            sigma_high = self.star_sigma_high_spin.value()
+            sigma_low = self.star_sigma_low_spin.value()
+            stack_cmd = f"stack r_{seq_name} rej {sigma_low} {sigma_high}"
+        
+        worker.cmd(stack_cmd, "-norm=addscale", "-output_norm", "-rgb_equal",
+                   "-out=../final_stack/stars_stacked")
+        
+        worker.cmd("cd", "..")
+    
+    def stack_comet(self, worker: SirilWorker):
+        """Stack frames aligned on comet (called separately after manual registration)."""
+        worker.cmd("cd", "process")
+        
+        seq_name = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+        rejection = self.rejection_combo.currentText()
+        
+        if rejection == "none":
+            stack_cmd = f"stack c_r_{seq_name} rej none"
+        else:
+            sigma_high = self.comet_sigma_high_spin.value()
+            sigma_low = self.comet_sigma_low_spin.value()
+            stack_cmd = f"stack c_r_{seq_name} rej {sigma_low} {sigma_high}"
+        
+        worker.cmd(stack_cmd, "-norm=addscale", "-out=../final_stack/comet_stacked")
+        
+        worker.cmd("cd", "..")
+    
+    def apply_starnet(self, worker: SirilWorker):
+        """Apply StarNet++ to remove stars."""
+        # Check if StarNet is available
+        try:
+            starnet_exe = worker.siril.get_siril_config("starnet", "starnet_exe")
+            if not starnet_exe:
+                worker.log_message.emit("StarNet++ not configured in Siril, skipping", "salmon")
+                return
+        except:
+            worker.log_message.emit("Could not check StarNet++ availability, skipping", "salmon")
+            return
+        
+        worker.cmd("cd", "final_stack")
+        
+        # Apply to star stack
+        if (Path(self.working_dir) / "final_stack" / "stars_stacked.fit").exists():
+            worker.cmd("load", "stars_stacked.fit")
+            worker.cmd("starnet", "-stretch", "-nostarmask")
+            worker.cmd("save", "stars_stacked_starless.fit")
+        
+        # Apply to comet stack if it exists
+        if (Path(self.working_dir) / "final_stack" / "comet_stacked.fit").exists():
+            worker.cmd("load", "comet_stacked.fit")
+            worker.cmd("starnet", "-stretch", "-nostarmask")
+            worker.cmd("save", "comet_stacked_starless.fit")
+        
+        worker.cmd("cd", "..")
+    
+    def create_animation(self, worker: SirilWorker):
+        """Create timelapse animation."""
+        # Check for FFmpeg
+        ffmpeg_available = shutil.which("ffmpeg") is not None
+        
+        if not ffmpeg_available:
+            worker.log_message.emit("FFmpeg not found in PATH, skipping animation", "salmon")
+            return
+        
+        seq_name = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+        
+        worker.cmd("cd", "process")
+        
+        # Load registered sequence
+        worker.cmd("load", f"r_{seq_name}_00001.fit")
+        
+        # Create star-fixed timelapse
+        timelapse_dir = Path(self.working_dir) / "timelapse_images"
+        
+        # Export sequence frames with autostretch
+        worker.log_message.emit("Exporting star-fixed frames...", "blue")
+        
+        # Get sequence info to iterate through frames
+        seq_files = sorted(Path(self.working_dir).glob(f"process/r_{seq_name}_*.fit"))
+        
+        for i, fits_file in enumerate(seq_files):
+            worker.cmd("load", fits_file.name)
+            worker.cmd("autostretch")
+            output_name = timelapse_dir / f"star_fixed_{i:04d}.tif"
+            worker.cmd("savetif", str(output_name))
+        
+        # Create video with FFmpeg
+        fps = self.fps_spin.value()
+        crf = self.crf_spin.value()
+        
+        video_output = Path(self.working_dir) / "star_fixed_timelapse.mp4"
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-pattern_type", "glob",
+            "-i", str(timelapse_dir / "star_fixed_*.tif"),
+            "-vcodec", "libx264",
+            "-crf", str(crf),
+            "-pix_fmt", "yuv420p",
+            str(video_output)
+        ]
+        
+        worker.log_message.emit(f"Running FFmpeg: {' '.join(cmd)}", "blue")
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            worker.log_message.emit(f"Video created: {video_output}", "green")
+        else:
+            worker.log_message.emit(f"FFmpeg error: {result.stderr}", "red")
+        
+        worker.cmd("cd", "..")
+    
+    def on_processing_finished(self, success: bool, message: str):
+        """Handle processing completion."""
+        self.start_button.setEnabled(True)
+        
+        if success:
+            QMessageBox.information(self, "Processing Complete", 
+                                    "Initial processing complete.\n\n"
+                                    "Go to 'Comet Selection' tab to:\n"
+                                    "1. Select frames for comet trajectory\n"
+                                    "2. Mark comet positions\n"
+                                    "3. Complete comet registration in Siril\n"
+                                    "4. Return to stack the comet")
+        else:
+            QMessageBox.warning(self, "Processing Error", f"Processing failed: {message}")
+    
+    def save_preset(self):
+        """Save current settings to preset file."""
+        preset_data = {
+            "bias_coefficient": self.bias_coeff_spin.value(),
+            "use_flats": self.use_flats_check.isChecked(),
+            "background_extraction": self.background_extract_check.isChecked(),
+            "filter_roundness": {
+                "enabled": self.filter_round_check.isChecked(),
+                "value": self.filter_round_spin.value()
+            },
+            "filter_fwhm": {
+                "enabled": self.filter_fwhm_check.isChecked(),
+                "value": self.filter_fwhm_spin.value()
+            },
+            "rejection_algorithm": self.rejection_combo.currentText(),
+            "star_sigma_high": self.star_sigma_high_spin.value(),
+            "star_sigma_low": self.star_sigma_low_spin.value(),
+            "comet_sigma_high": self.comet_sigma_high_spin.value(),
+            "comet_sigma_low": self.comet_sigma_low_spin.value(),
+            "starnet": self.starnet_check.isChecked(),
+            "animation": {
+                "enabled": self.create_animation_check.isChecked(),
+                "fps": self.fps_spin.value(),
+                "crf": self.crf_spin.value()
+            }
+        }
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Preset", "", "JSON Files (*.json)"
+        )
+        
+        if file_path:
+            with open(file_path, 'w') as f:
+                json.dump(preset_data, f, indent=2)
+            self.log(f"Preset saved: {file_path}", "green")
+    
+    def load_preset(self):
+        """Load settings from preset file."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Load Preset", "", "JSON Files (*.json)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'r') as f:
+                    preset_data = json.load(f)
+                
+                self.bias_coeff_spin.setValue(preset_data.get("bias_coefficient", 8))
+                self.use_flats_check.setChecked(preset_data.get("use_flats", True))
+                self.background_extract_check.setChecked(preset_data.get("background_extraction", False))
+                
+                filter_round = preset_data.get("filter_roundness", {})
+                self.filter_round_check.setChecked(filter_round.get("enabled", False))
+                self.filter_round_spin.setValue(filter_round.get("value", 3.0))
+                
+                filter_fwhm = preset_data.get("filter_fwhm", {})
+                self.filter_fwhm_check.setChecked(filter_fwhm.get("enabled", False))
+                self.filter_fwhm_spin.setValue(filter_fwhm.get("value", 3.0))
+                
+                rejection = preset_data.get("rejection_algorithm", "winsorized")
+                index = self.rejection_combo.findText(rejection)
+                if index >= 0:
+                    self.rejection_combo.setCurrentIndex(index)
+                
+                self.star_sigma_high_spin.setValue(preset_data.get("star_sigma_high", 3.0))
+                self.star_sigma_low_spin.setValue(preset_data.get("star_sigma_low", 3.0))
+                self.comet_sigma_high_spin.setValue(preset_data.get("comet_sigma_high", 3.0))
+                self.comet_sigma_low_spin.setValue(preset_data.get("comet_sigma_low", 3.0))
+                
+                self.starnet_check.setChecked(preset_data.get("starnet", False))
+                
+                animation = preset_data.get("animation", {})
+                self.create_animation_check.setChecked(animation.get("enabled", False))
+                self.fps_spin.setValue(animation.get("fps", 24))
+                self.crf_spin.setValue(animation.get("crf", 23))
+                
+                self.log(f"Preset loaded: {file_path}", "green")
+                
+            except Exception as e:
+                QMessageBox.warning(self, "Load Error", f"Failed to load preset: {e}")
+    
+    def save_settings(self):
+        """Save current settings to config file."""
+        config_path = Path.home() / ".comet_stacker_config.json"
+        
+        settings = {
+            "last_directory": self.working_dir,
+            "bias_coefficient": self.bias_coeff_spin.value()
+        }
+        
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except:
+            pass
+    
+    def load_settings(self):
+        """Load settings from config file."""
+        config_path = Path.home() / ".comet_stacker_config.json"
+        
+        if config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    settings = json.load(f)
+                
+                if "bias_coefficient" in settings:
+                    self.bias_coeff_spin.setValue(settings["bias_coefficient"])
+                    
+            except:
+                pass
+    
+    def closeEvent(self, event):
+        """Handle window close."""
+        self.save_settings()
+        event.accept()
+
+
+def main():
+    """Main entry point."""
+    # Ensure required dependencies are installed
+    try:
+        sirilpy.ensure_installed(
+            "PyQt5", "numpy", "astropy", "pillow",
+            version_constraints=[None, ">=1.20.0", ">=4.0", None]
+        )
+    except Exception as e:
+        print(f"Error ensuring dependencies: {e}")
+        return 1
+    
+    # Create Siril interface
+    try:
+        siril = sirilpy.SirilInterface()
+    except Exception as e:
+        print(f"Error creating Siril interface: {e}")
+        return 1
+    
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')  # Modern look
+    
+    window = CometStackerGUI(siril_instance=siril)
+    window.show()
+    
+    result = app.exec_()
+    return 0 if result == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
