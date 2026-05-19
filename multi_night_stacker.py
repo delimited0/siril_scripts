@@ -52,7 +52,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QDoubleSpinBox, QTextEdit, QFileDialog, 
     QGroupBox, QGridLayout, QMessageBox, QProgressBar, QCheckBox,
-    QLineEdit
+    QLineEdit, QComboBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
@@ -205,7 +205,13 @@ class MultiNightStackerGUI(QMainWindow):
         self.debayer_check = QCheckBox("Debayer (OSC Camera)")
         self.debayer_check.setChecked(True)
         self.debayer_check.setToolTip("Enable for color cameras (OSC/DSLR)")
+        self.debayer_check.stateChanged.connect(self.on_debayer_changed)
         calib_layout.addWidget(self.debayer_check, 2, 0, 1, 2)
+        
+        self.equalize_cfa_check = QCheckBox("Equalize CFA")
+        self.equalize_cfa_check.setChecked(False)
+        self.equalize_cfa_check.setToolTip("Equalize CFA channels during flat calibration")
+        calib_layout.addWidget(self.equalize_cfa_check, 3, 0, 1, 2)
         
         calib_group.setLayout(calib_layout)
         main_layout.addWidget(calib_group)
@@ -214,31 +220,57 @@ class MultiNightStackerGUI(QMainWindow):
         stack_group = QGroupBox("Stacking Settings")
         stack_layout = QGridLayout()
         
-        stack_layout.addWidget(QLabel("Sigma High (rejection):"), 0, 0)
-        self.sigma_high_spin = QDoubleSpinBox()
-        self.sigma_high_spin.setRange(0.1, 10.0)
-        self.sigma_high_spin.setValue(3.0)
-        self.sigma_high_spin.setDecimals(1)
-        self.sigma_high_spin.setToolTip("High sigma threshold for rejection")
-        stack_layout.addWidget(self.sigma_high_spin, 0, 1)
+        stack_layout.addWidget(QLabel("Rejection Method:"), 0, 0)
+        self.rejection_method_combo = QComboBox()
+        self.rejection_method_combo.addItem("None", "none")
+        self.rejection_method_combo.addItem("Percentile Clipping", "percentile")
+        self.rejection_method_combo.addItem("Sigma Clipping", "sigma")
+        self.rejection_method_combo.addItem("Median Clipping", "median")
+        self.rejection_method_combo.addItem("Winsorized Sigma Clipping", "winsorized")
+        self.rejection_method_combo.addItem("Linear Fit Clipping", "linear")
+        self.rejection_method_combo.addItem("Generalized ESD Test", "generalized")
+        self.rejection_method_combo.addItem("k-MAD Clipping", "mad")
+        self.rejection_method_combo.setCurrentIndex(4)  # Default to Winsorized
+        self.rejection_method_combo.setToolTip(
+            "None: No rejection\n"
+            "Percentile: Percentile clipping\n"
+            "Sigma: Sigma clipping\n"
+            "Median: Median clipping\n"
+            "Winsorized: Winsorized sigma clipping (default)\n"
+            "Linear: Linear fit clipping\n"
+            "Generalized: Generalized Extreme Studentized Deviate Test\n"
+            "k-MAD: Median Absolute Deviation clipping"
+        )
+        self.rejection_method_combo.currentIndexChanged.connect(self.on_rejection_method_changed)
+        stack_layout.addWidget(self.rejection_method_combo, 0, 1)
         
-        stack_layout.addWidget(QLabel("Sigma Low (rejection):"), 1, 0)
+        self.sigma_high_label = QLabel("Sigma High (rejection):")
+        stack_layout.addWidget(self.sigma_high_label, 1, 0)
+        self.sigma_high_spin = QDoubleSpinBox()
+        self.sigma_high_spin.setRange(0.01, 10.0)
+        self.sigma_high_spin.setValue(3.0)
+        self.sigma_high_spin.setDecimals(2)
+        self.sigma_high_spin.setToolTip("High sigma threshold for rejection")
+        stack_layout.addWidget(self.sigma_high_spin, 1, 1)
+        
+        self.sigma_low_label = QLabel("Sigma Low (rejection):")
+        stack_layout.addWidget(self.sigma_low_label, 2, 0)
         self.sigma_low_spin = QDoubleSpinBox()
-        self.sigma_low_spin.setRange(0.1, 10.0)
+        self.sigma_low_spin.setRange(0.01, 10.0)
         self.sigma_low_spin.setValue(3.0)
-        self.sigma_low_spin.setDecimals(1)
+        self.sigma_low_spin.setDecimals(2)
         self.sigma_low_spin.setToolTip("Low sigma threshold for rejection")
-        stack_layout.addWidget(self.sigma_low_spin, 1, 1)
+        stack_layout.addWidget(self.sigma_low_spin, 2, 1)
         
         self.normalize_check = QCheckBox("Output Normalization")
         self.normalize_check.setChecked(True)
         self.normalize_check.setToolTip("Normalize output histogram")
-        stack_layout.addWidget(self.normalize_check, 2, 0, 1, 2)
+        stack_layout.addWidget(self.normalize_check, 3, 0, 1, 2)
         
         self.rgb_equal_check = QCheckBox("RGB Equalization")
         self.rgb_equal_check.setChecked(True)
         self.rgb_equal_check.setToolTip("Equalize RGB channels (for color images)")
-        stack_layout.addWidget(self.rgb_equal_check, 3, 0, 1, 2)
+        stack_layout.addWidget(self.rgb_equal_check, 4, 0, 1, 2)
         
         stack_group.setLayout(stack_layout)
         main_layout.addWidget(stack_group)
@@ -283,6 +315,50 @@ class MultiNightStackerGUI(QMainWindow):
         
         if not SIRILPY_AVAILABLE:
             self.log("WARNING: sirilpy not available. Siril integration will not work.", "red")
+    
+    def on_debayer_changed(self):
+        """Show or hide Equalize CFA checkbox based on debayer state."""
+        self.equalize_cfa_check.setVisible(self.debayer_check.isChecked())
+    
+    def on_rejection_method_changed(self):
+        """Enable or disable sigma spinboxes and update labels based on rejection method."""
+        rejection_method = self.rejection_method_combo.currentData()
+        
+        if rejection_method == "none":
+            # Disable sigma spinboxes if "none" is selected
+            self.sigma_high_spin.setEnabled(False)
+            self.sigma_low_spin.setEnabled(False)
+            # Reset to standard labels
+            self.sigma_high_label.setText("Sigma High (rejection):")
+            self.sigma_low_label.setText("Sigma Low (rejection):")
+            self.sigma_high_spin.setToolTip("High sigma threshold for rejection")
+            self.sigma_low_spin.setToolTip("Low sigma threshold for rejection")
+        elif rejection_method == "generalized":
+            # Generalized ESD uses different parameters
+            self.sigma_high_spin.setEnabled(True)
+            self.sigma_low_spin.setEnabled(True)
+            self.sigma_high_label.setText("Outliers (fraction):")
+            self.sigma_low_label.setText("Significance (alpha):")
+            self.sigma_high_spin.setToolTip("Expected fraction of outliers (default: 0.3)")
+            self.sigma_low_spin.setToolTip("Significance level for rejection (default: 0.05)")
+            # Set Generalized ESD defaults if values are at standard sigma defaults
+            if abs(self.sigma_high_spin.value() - 3.0) < 0.01:
+                self.sigma_high_spin.setValue(0.3)
+            if abs(self.sigma_low_spin.value() - 3.0) < 0.01:
+                self.sigma_low_spin.setValue(0.05)
+        else:
+            # Standard sigma rejection parameters
+            self.sigma_high_spin.setEnabled(True)
+            self.sigma_low_spin.setEnabled(True)
+            self.sigma_high_label.setText("Sigma High (rejection):")
+            self.sigma_low_label.setText("Sigma Low (rejection):")
+            self.sigma_high_spin.setToolTip("High sigma threshold for rejection")
+            self.sigma_low_spin.setToolTip("Low sigma threshold for rejection")
+            # Reset to standard defaults if values are at Generalized ESD defaults
+            if abs(self.sigma_high_spin.value() - 0.3) < 0.01:
+                self.sigma_high_spin.setValue(3.0)
+            if abs(self.sigma_low_spin.value() - 0.05) < 0.01:
+                self.sigma_low_spin.setValue(3.0)
     
     def log(self, message: str, color: str = "black"):
         """Add message to log with color."""
@@ -380,12 +456,24 @@ class MultiNightStackerGUI(QMainWindow):
             return
         
         # Confirm with user
+        rejection_method = self.rejection_method_combo.currentData()
+        rejection_name = self.rejection_method_combo.currentText()
+        
+        if rejection_method == "generalized":
+            params_text = f"Rejection: {rejection_name}\n" \
+                         f"  Outliers: {self.sigma_high_spin.value()}, Significance: {self.sigma_low_spin.value()}"
+        elif rejection_method == "none":
+            params_text = f"Rejection: {rejection_name}"
+        else:
+            params_text = f"Rejection: {rejection_name}\n" \
+                         f"  Sigma: {self.sigma_low_spin.value()}/{self.sigma_high_spin.value()}"
+        
         reply = QMessageBox.question(
             self, "Start Processing",
             f"Process {len(self.detected_sets)} sets?\n\n"
             f"Sets: {', '.join(self.detected_sets)}\n"
             f"Sequence name: {seq_name}\n"
-            f"Sigma rejection: {self.sigma_low_spin.value()}/{self.sigma_high_spin.value()}\n\n"
+            f"{params_text}\n\n"
             f"This will:\n"
             f"1. Calibrate each set individually\n"
             f"2. Combine all calibrated lights\n"
@@ -492,7 +580,10 @@ class MultiNightStackerGUI(QMainWindow):
             calib_args.append("-flat=pp_flat_stacked")
         
         if self.debayer_check.isChecked():
-            calib_args.extend(["-cfa", "-equalize_cfa", "-debayer"])
+            calib_args.append("-cfa")
+            if self.equalize_cfa_check.isChecked():
+                calib_args.append("-equalize_cfa")
+            calib_args.append("-debayer")
         
         worker.cmd(*calib_args)
         worker.cmd("cd", self.working_dir)
@@ -541,10 +632,16 @@ class MultiNightStackerGUI(QMainWindow):
         worker.cmd("cd", str(combined_dir))
         
         # Build stack command
+        rejection_method = self.rejection_method_combo.currentData()
         sigma_low = self.sigma_low_spin.value()
         sigma_high = self.sigma_high_spin.value()
         
-        stack_args = ["stack", f"r_{seq_name}", "rej", str(sigma_low), str(sigma_high)]
+        stack_args = ["stack", f"r_{seq_name}", "rej", rejection_method]
+        
+        # Add sigma values only if rejection method is not "none"
+        if rejection_method != "none":
+            stack_args.extend([str(sigma_low), str(sigma_high)])
+        
         stack_args.append("-norm=addscale")
         
         if self.normalize_check.isChecked():
@@ -582,6 +679,8 @@ class MultiNightStackerGUI(QMainWindow):
             "bias_coefficient": self.bias_coeff_spin.value(),
             "use_flats": self.use_flats_check.isChecked(),
             "debayer": self.debayer_check.isChecked(),
+            "equalize_cfa": self.equalize_cfa_check.isChecked(),
+            "rejection_method": self.rejection_method_combo.currentData(),
             "sigma_high": self.sigma_high_spin.value(),
             "sigma_low": self.sigma_low_spin.value(),
             "output_normalization": self.normalize_check.isChecked(),
@@ -612,8 +711,22 @@ class MultiNightStackerGUI(QMainWindow):
                 self.bias_coeff_spin.setValue(preset_data.get("bias_coefficient", 8))
                 self.use_flats_check.setChecked(preset_data.get("use_flats", True))
                 self.debayer_check.setChecked(preset_data.get("debayer", True))
+                self.equalize_cfa_check.setChecked(preset_data.get("equalize_cfa", False))
+                
+                # Load rejection method
+                rejection_method = preset_data.get("rejection_method", "winsorized")
+                for i in range(self.rejection_method_combo.count()):
+                    if self.rejection_method_combo.itemData(i) == rejection_method:
+                        self.rejection_method_combo.setCurrentIndex(i)
+                        break
+                
+                # Load sigma/parameter values before triggering UI update
                 self.sigma_high_spin.setValue(preset_data.get("sigma_high", 3.0))
                 self.sigma_low_spin.setValue(preset_data.get("sigma_low", 3.0))
+                
+                # Update UI labels based on loaded rejection method
+                self.on_rejection_method_changed()
+                
                 self.normalize_check.setChecked(preset_data.get("output_normalization", True))
                 self.rgb_equal_check.setChecked(preset_data.get("rgb_equalization", True))
                 

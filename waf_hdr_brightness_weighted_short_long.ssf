@@ -1,0 +1,66 @@
+#############################################
+#
+# Script for Siril 1.2
+# WAF-HDR_brightness_weighted - 2 Exposure Version
+#
+# Based on original by WA (Bill) Flowers
+# Modified for short + long exposure HDR compositing
+#
+# The work is based on a description of how to do this with layers in GIMP
+#   https://www.instructables.com/HDR-photos-with-the-GIMP/
+#
+#### BRIGHTNESS WEIGHTED HDR COMPOSITING ####
+# In an empty directory put images named long.fit and short.fit
+# short = short exposure (preserves highlights/stars)
+# long = long exposure (shows faint detail)
+# They will be aligned, cropped and blended
+# using brightness-weighted HDR compositing.
+
+requires 1.2.0
+
+# Build a sequence creating a Process sub-directory
+convert HDRin_ -out=Process
+cd Process
+
+# Back up original (linear) image data before stretching
+load HDRin_00001
+save orig_long
+load HDRin_00002
+save orig_short
+
+# Normalize brightness so star detection finds the same stars in both frames
+load HDRin_00001
+autostretch
+save HDRin_00001
+load HDRin_00002
+autostretch
+save HDRin_00002
+
+# Register on the stretched (brightness-matched) images
+setref HDRin_ 1
+register HDRin_ -2pass
+
+# Restore original linear images before applying registration transforms
+load orig_long
+save HDRin_00001
+load orig_short
+save HDRin_00002
+
+# Crop the 2 images to their common area using transforms computed above
+seqapplyreg HDRin_ -framing=min
+
+# long will be 00001
+# short will be 00002
+
+# Extract luminance from LONG exposure to use as blend weight
+load r_HDRin_00001
+split Llong a b -lab
+
+# Create RGB weight image from long luminance (already 0-1 normalized)
+rgbcomp Llong Llong Llong -out=Wlong
+
+# HDR blend: where long is bright -> use short; where long is dim -> use long
+# Formula: HDR = Llong * short + (1-Llong) * long
+pm "$Wlong$ * $r_HDRin_00002$ + ~$Wlong$ * $r_HDRin_00001$"
+cd ..
+save HDR

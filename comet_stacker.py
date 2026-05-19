@@ -76,7 +76,13 @@ except ImportError:
 
 
 class FITSViewer(QWidget):
-    """Custom widget for displaying FITS images with selection box capability."""
+    """Custom widget for displaying FITS images with zoom, pan, and selection box.
+    
+    Controls:
+        - Scroll wheel: zoom in/out
+        - Right-click drag (or middle-click drag): pan the image
+        - Left-click drag: draw selection box on the image
+    """
     
     selection_changed = pyqtSignal(QRect)  # Emits selection rectangle
     
@@ -85,9 +91,15 @@ class FITSViewer(QWidget):
         self.image_data = None
         self.pixmap = None
         self.selection_start = None
-        self.selection_rect = QRect()
+        self.selection_rect = QRect()  # In image pixel coordinates
         self.is_selecting = False
-        self.scale_factor = 1.0
+        self.scale_factor = 1.0  # FITS downsample factor
+        
+        # Zoom and pan state
+        self.zoom_level = 1.0
+        self.pan_offset = QPoint(0, 0)
+        self.is_panning = False
+        self.pan_start = QPoint()
         
         self.setMinimumSize(400, 400)
         self.setMouseTracking(True)
@@ -100,11 +112,10 @@ class FITSViewer(QWidget):
                 
                 # Handle color images (3D arrays)
                 if len(data.shape) == 3:
-                    # Assume CFA or RGB format, take one channel or convert
                     if data.shape[0] == 3:  # RGB format
                         data = np.mean(data, axis=0)
                     else:
-                        data = data[0]  # Take first channel
+                        data = data[0]
                 
                 # Downsample
                 if downsample > 1:
@@ -124,12 +135,47 @@ class FITSViewer(QWidget):
                 q_image = QImage(data_normalized.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
                 self.pixmap = QPixmap.fromImage(q_image)
                 
+                # Reset zoom/pan to fit image in widget
+                self._fit_to_widget()
                 self.update()
                 return True
                 
         except Exception as e:
             print(f"Error loading FITS: {e}")
             return False
+    
+    def _fit_to_widget(self):
+        """Set zoom level so the full image fits within the widget."""
+        if not self.pixmap:
+            return
+        scale_x = self.width() / self.pixmap.width()
+        scale_y = self.height() / self.pixmap.height()
+        self.zoom_level = min(scale_x, scale_y, 1.0)
+        self.pan_offset = QPoint(0, 0)
+    
+    def _image_origin(self) -> QPoint:
+        """Top-left corner of the zoomed image in widget coordinates."""
+        if not self.pixmap:
+            return QPoint(0, 0)
+        scaled_w = int(self.pixmap.width() * self.zoom_level)
+        scaled_h = int(self.pixmap.height() * self.zoom_level)
+        x = (self.width() - scaled_w) // 2 + self.pan_offset.x()
+        y = (self.height() - scaled_h) // 2 + self.pan_offset.y()
+        return QPoint(x, y)
+    
+    def _widget_to_image(self, widget_pos: QPoint) -> QPoint:
+        """Convert widget coordinates to image pixel coordinates."""
+        origin = self._image_origin()
+        ix = int((widget_pos.x() - origin.x()) / self.zoom_level)
+        iy = int((widget_pos.y() - origin.y()) / self.zoom_level)
+        return QPoint(ix, iy)
+    
+    def _image_to_widget(self, image_pos: QPoint) -> QPoint:
+        """Convert image pixel coordinates to widget coordinates."""
+        origin = self._image_origin()
+        wx = int(image_pos.x() * self.zoom_level) + origin.x()
+        wy = int(image_pos.y() * self.zoom_level) + origin.y()
+        return QPoint(wx, wy)
     
     def clear_selection(self):
         """Clear the current selection box."""
@@ -149,58 +195,97 @@ class FITSViewer(QWidget):
         return (x, y, w, h)
     
     def paintEvent(self, event):
-        """Draw the image and selection box."""
+        """Draw the zoomed/panned image and selection box."""
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
         
         if self.pixmap:
-            # Draw image centered
-            x = (self.width() - self.pixmap.width()) // 2
-            y = (self.height() - self.pixmap.height()) // 2
-            painter.drawPixmap(x, y, self.pixmap)
+            origin = self._image_origin()
+            scaled_w = int(self.pixmap.width() * self.zoom_level)
+            scaled_h = int(self.pixmap.height() * self.zoom_level)
+            target_rect = QRect(origin.x(), origin.y(), scaled_w, scaled_h)
+            painter.drawPixmap(target_rect, self.pixmap)
             
-            # Draw selection box
+            # Draw selection box (stored in image coords, convert to widget)
             if not self.selection_rect.isNull():
                 painter.setPen(QPen(QColor(0, 255, 0), 2, Qt.SolidLine))
-                adjusted_rect = self.selection_rect.translated(x, y)
-                painter.drawRect(adjusted_rect)
+                tl = self._image_to_widget(self.selection_rect.topLeft())
+                br = self._image_to_widget(self.selection_rect.bottomRight())
+                painter.drawRect(QRect(tl, br))
         else:
-            painter.drawText(self.rect(), Qt.AlignCenter, "No image loaded")
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "No image loaded\n\nScroll to zoom, right-drag to pan")
     
     def mousePressEvent(self, event):
-        """Start selection box."""
-        if event.button() == Qt.LeftButton and self.pixmap:
-            # Convert to image coordinates
-            x_offset = (self.width() - self.pixmap.width()) // 2
-            y_offset = (self.height() - self.pixmap.height()) // 2
-            
-            pos = event.pos() - QPoint(x_offset, y_offset)
-            
-            if 0 <= pos.x() < self.pixmap.width() and 0 <= pos.y() < self.pixmap.height():
-                self.selection_start = pos
-                self.selection_rect = QRect(pos, pos)
+        """Left-click: start selection. Right/middle-click: start panning."""
+        if not self.pixmap:
+            return
+        
+        if event.button() in (Qt.RightButton, Qt.MiddleButton):
+            self.is_panning = True
+            self.pan_start = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+        elif event.button() == Qt.LeftButton:
+            img_pos = self._widget_to_image(event.pos())
+            if 0 <= img_pos.x() < self.pixmap.width() and 0 <= img_pos.y() < self.pixmap.height():
+                self.selection_start = img_pos
+                self.selection_rect = QRect(img_pos, img_pos)
                 self.is_selecting = True
     
     def mouseMoveEvent(self, event):
-        """Update selection box while dragging."""
-        if self.is_selecting and self.selection_start:
-            x_offset = (self.width() - self.pixmap.width()) // 2
-            y_offset = (self.height() - self.pixmap.height()) // 2
-            
-            pos = event.pos() - QPoint(x_offset, y_offset)
-            
-            # Clamp to image bounds
-            pos.setX(max(0, min(pos.x(), self.pixmap.width() - 1)))
-            pos.setY(max(0, min(pos.y(), self.pixmap.height() - 1)))
-            
-            self.selection_rect = QRect(self.selection_start, pos).normalized()
+        """Drag to pan or update selection."""
+        if self.is_panning:
+            delta = event.pos() - self.pan_start
+            self.pan_offset += delta
+            self.pan_start = event.pos()
+            self.update()
+        elif self.is_selecting and self.selection_start and self.pixmap:
+            img_pos = self._widget_to_image(event.pos())
+            img_pos.setX(max(0, min(img_pos.x(), self.pixmap.width() - 1)))
+            img_pos.setY(max(0, min(img_pos.y(), self.pixmap.height() - 1)))
+            self.selection_rect = QRect(self.selection_start, img_pos).normalized()
             self.update()
     
     def mouseReleaseEvent(self, event):
-        """Finish selection box."""
-        if event.button() == Qt.LeftButton and self.is_selecting:
+        """Finish panning or selection."""
+        if event.button() in (Qt.RightButton, Qt.MiddleButton) and self.is_panning:
+            self.is_panning = False
+            self.setCursor(Qt.ArrowCursor)
+        elif event.button() == Qt.LeftButton and self.is_selecting:
             self.is_selecting = False
             if not self.selection_rect.isNull():
                 self.selection_changed.emit(self.selection_rect)
+    
+    def wheelEvent(self, event):
+        """Zoom in/out centered on the mouse position."""
+        if not self.pixmap:
+            return
+        
+        old_zoom = self.zoom_level
+        zoom_factor = 1.15
+        
+        if event.angleDelta().y() > 0:
+            self.zoom_level *= zoom_factor
+        else:
+            self.zoom_level /= zoom_factor
+        
+        # Clamp zoom
+        min_zoom = min(0.1, min(self.width() / self.pixmap.width(),
+                                self.height() / self.pixmap.height()) * 0.5)
+        self.zoom_level = max(min_zoom, min(self.zoom_level, 20.0))
+        
+        # Zoom toward mouse position
+        mouse_pos = event.pos()
+        center_before = QPoint(
+            self.width() // 2 + self.pan_offset.x(),
+            self.height() // 2 + self.pan_offset.y()
+        )
+        scale_ratio = self.zoom_level / old_zoom
+        new_pan_x = int(mouse_pos.x() - (mouse_pos.x() - center_before.x()) * scale_ratio) - self.width() // 2
+        new_pan_y = int(mouse_pos.y() - (mouse_pos.y() - center_before.y()) * scale_ratio) - self.height() // 2
+        self.pan_offset = QPoint(new_pan_x, new_pan_y)
+        
+        self.update()
 
 
 class SirilWorker(QThread):
@@ -274,6 +359,9 @@ class CometStackerGUI(QMainWindow):
                     # Create required subdirectories
                     for subdir in ["process", "masters", "final_stack", "timelapse_images"]:
                         (wd_path / subdir).mkdir(exist_ok=True)
+                    
+                    # Auto-set last frame from lights count
+                    self.update_frame_defaults()
             except AttributeError as e:
                 self.log(f"Siril not connected properly: {e}", "red")
             except Exception as e:
@@ -331,6 +419,14 @@ class CometStackerGUI(QMainWindow):
         self.background_extract_check.setChecked(False)
         calib_layout.addWidget(self.background_extract_check, 2, 0, 1, 2)
         
+        self.skip_calibration_check = QCheckBox("Skip Calibration (resume)")
+        self.skip_calibration_check.setChecked(False)
+        self.skip_calibration_check.setToolTip(
+            "Skip calibration and registration steps.\n"
+            "Use this to resume from previously processed files in the process/ directory."
+        )
+        calib_layout.addWidget(self.skip_calibration_check, 3, 0, 1, 2)
+        
         calib_group.setLayout(calib_layout)
         left_layout.addWidget(calib_group)
         
@@ -361,39 +457,50 @@ class CometStackerGUI(QMainWindow):
         stack_group = QGroupBox("Stacking Settings")
         stack_layout = QGridLayout()
         
-        stack_layout.addWidget(QLabel("Rejection Algorithm:"), 0, 0)
+        stack_layout.addWidget(QLabel("Stacking Mode:"), 0, 0)
+        self.stacking_mode_combo = QComboBox()
+        self.stacking_mode_combo.addItems(["Stars Only", "Comet Only", "Both (Stars + Comet)"])
+        self.stacking_mode_combo.setCurrentText("Both (Stars + Comet)")
+        self.stacking_mode_combo.setToolTip(
+            "Stars Only: stack aligned on stars\n"
+            "Comet Only: stack aligned on comet (requires prior comet registration)\n"
+            "Both: run star stack, then comet stack after manual registration"
+        )
+        stack_layout.addWidget(self.stacking_mode_combo, 0, 1)
+        
+        stack_layout.addWidget(QLabel("Rejection Algorithm:"), 1, 0)
         self.rejection_combo = QComboBox()
         self.rejection_combo.addItems(["winsorized", "sigmedian", "median", "linear", "none"])
         self.rejection_combo.setCurrentText("winsorized")
-        stack_layout.addWidget(self.rejection_combo, 0, 1)
+        stack_layout.addWidget(self.rejection_combo, 1, 1)
         
-        stack_layout.addWidget(QLabel("Star Stack Sigma High:"), 1, 0)
+        stack_layout.addWidget(QLabel("Star Stack Sigma High:"), 2, 0)
         self.star_sigma_high_spin = QDoubleSpinBox()
         self.star_sigma_high_spin.setRange(0.1, 10.0)
         self.star_sigma_high_spin.setValue(3.0)
         self.star_sigma_high_spin.setDecimals(1)
-        stack_layout.addWidget(self.star_sigma_high_spin, 1, 1)
+        stack_layout.addWidget(self.star_sigma_high_spin, 2, 1)
         
-        stack_layout.addWidget(QLabel("Star Stack Sigma Low:"), 2, 0)
+        stack_layout.addWidget(QLabel("Star Stack Sigma Low:"), 3, 0)
         self.star_sigma_low_spin = QDoubleSpinBox()
         self.star_sigma_low_spin.setRange(0.1, 10.0)
         self.star_sigma_low_spin.setValue(3.0)
         self.star_sigma_low_spin.setDecimals(1)
-        stack_layout.addWidget(self.star_sigma_low_spin, 2, 1)
+        stack_layout.addWidget(self.star_sigma_low_spin, 3, 1)
         
-        stack_layout.addWidget(QLabel("Comet Stack Sigma High:"), 3, 0)
+        stack_layout.addWidget(QLabel("Comet Stack Sigma High:"), 4, 0)
         self.comet_sigma_high_spin = QDoubleSpinBox()
         self.comet_sigma_high_spin.setRange(0.1, 10.0)
         self.comet_sigma_high_spin.setValue(3.0)
         self.comet_sigma_high_spin.setDecimals(1)
-        stack_layout.addWidget(self.comet_sigma_high_spin, 3, 1)
+        stack_layout.addWidget(self.comet_sigma_high_spin, 4, 1)
         
-        stack_layout.addWidget(QLabel("Comet Stack Sigma Low:"), 4, 0)
+        stack_layout.addWidget(QLabel("Comet Stack Sigma Low:"), 5, 0)
         self.comet_sigma_low_spin = QDoubleSpinBox()
         self.comet_sigma_low_spin.setRange(0.1, 10.0)
         self.comet_sigma_low_spin.setValue(3.0)
         self.comet_sigma_low_spin.setDecimals(1)
-        stack_layout.addWidget(self.comet_sigma_low_spin, 4, 1)
+        stack_layout.addWidget(self.comet_sigma_low_spin, 5, 1)
         
         stack_group.setLayout(stack_layout)
         left_layout.addWidget(stack_group)
@@ -499,8 +606,8 @@ class CometStackerGUI(QMainWindow):
         frame_select_layout = QHBoxLayout()
         frame_select_layout.addWidget(QLabel("First Frame:"))
         self.first_frame_spin = QSpinBox()
-        self.first_frame_spin.setRange(0, 9999)
-        self.first_frame_spin.setValue(0)
+        self.first_frame_spin.setRange(1, 9999)
+        self.first_frame_spin.setValue(1)
         frame_select_layout.addWidget(self.first_frame_spin)
         
         load_first_btn = QPushButton("Load First")
@@ -509,8 +616,8 @@ class CometStackerGUI(QMainWindow):
         
         frame_select_layout.addWidget(QLabel("Last Frame:"))
         self.last_frame_spin = QSpinBox()
-        self.last_frame_spin.setRange(0, 9999)
-        self.last_frame_spin.setValue(0)
+        self.last_frame_spin.setRange(1, 9999)
+        self.last_frame_spin.setValue(1)
         frame_select_layout.addWidget(self.last_frame_spin)
         
         load_last_btn = QPushButton("Load Last")
@@ -544,11 +651,21 @@ class CometStackerGUI(QMainWindow):
         
         comet_select_layout.addLayout(viewers_layout)
         
-        # Register button
+        # Register and stack buttons
+        comet_btn_layout = QHBoxLayout()
+        
         self.register_comet_btn = QPushButton("Register Comet")
         self.register_comet_btn.clicked.connect(self.register_comet)
         self.register_comet_btn.setEnabled(False)
-        comet_select_layout.addWidget(self.register_comet_btn)
+        comet_btn_layout.addWidget(self.register_comet_btn)
+        
+        self.stack_comet_btn = QPushButton("Stack Comet")
+        self.stack_comet_btn.clicked.connect(self.start_comet_stacking)
+        self.stack_comet_btn.setEnabled(False)
+        self.stack_comet_btn.setToolTip("Run comet stacking after completing comet registration in Siril")
+        comet_btn_layout.addWidget(self.stack_comet_btn)
+        
+        comet_select_layout.addLayout(comet_btn_layout)
         
         self.tabs.addTab(comet_select_widget, "Comet Selection")
         
@@ -613,8 +730,14 @@ class CometStackerGUI(QMainWindow):
             for subdir in ["process", "masters", "final_stack", "timelapse_images"]:
                 (Path(directory) / subdir).mkdir(exist_ok=True)
             
+            # Auto-set last frame from lights count
+            self.update_frame_defaults()
+            
             # Update duration display
             self.update_current_duration_display()
+            
+            # Check if comet registration already exists
+            self.check_comet_registration_exists()
             
             self.log(f"Working directory set: {directory}", "green")
     
@@ -637,6 +760,45 @@ class CometStackerGUI(QMainWindow):
         first_coords = self.first_frame_viewer.get_selection_coords()
         last_coords = self.last_frame_viewer.get_selection_coords()
         self.register_comet_btn.setEnabled(first_coords is not None and last_coords is not None)
+    
+    def check_comet_registration_exists(self) -> bool:
+        """Check if comet-registered files exist and enable Stack Comet button if so."""
+        if not self.working_dir:
+            return False
+        
+        base_seq = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+        process_dir = Path(self.working_dir) / "process"
+        comet_files = list(process_dir.glob(f"comet_r_{base_seq}_*.fit"))
+        
+        if comet_files:
+            self.stack_comet_btn.setEnabled(True)
+            self.log(f"Found {len(comet_files)} comet-registered frames", "green")
+            return True
+        else:
+            return False
+    
+    def update_frame_defaults(self):
+        """Auto-set first/last frame spinboxes from the number of lights."""
+        if not self.working_dir:
+            return
+        
+        lights_dir = Path(self.working_dir) / "lights"
+        if not lights_dir.exists():
+            return
+        
+        # Count light frames (common FITS/RAW extensions)
+        light_files = []
+        for ext in ("*.fit", "*.fits", "*.FIT", "*.FITS",
+                    "*.cr2", "*.CR2", "*.cr3", "*.CR3",
+                    "*.nef", "*.NEF", "*.arw", "*.ARW",
+                    "*.tif", "*.tiff", "*.TIF", "*.TIFF"):
+            light_files.extend(lights_dir.glob(ext))
+        
+        num_lights = len(light_files)
+        if num_lights > 0:
+            self.first_frame_spin.setValue(1)
+            self.last_frame_spin.setValue(num_lights)
+            self.log(f"Found {num_lights} light frames, set frame range 1-{num_lights}", "green")
     
     def update_current_duration_display(self):
         """Update the current duration label based on available frames and FPS."""
@@ -695,6 +857,8 @@ class CometStackerGUI(QMainWindow):
         
         if viewer.load_fits(str(fits_path), downsample=4):
             self.log(f"Loaded frame {frame_num} for comet selection", "green")
+            # Check if comet registration already exists
+            self.check_comet_registration_exists()
         else:
             QMessageBox.warning(self, "Load Error", f"Failed to load frame {frame_num}")
     
@@ -738,6 +902,7 @@ class CometStackerGUI(QMainWindow):
         
         QMessageBox.information(self, "Complete Registration in Siril", instructions)
         
+        self.stack_comet_btn.setEnabled(True)
         self.log("Ready for comet stacking after manual registration", "green")
     
     def start_processing(self):
@@ -751,6 +916,39 @@ class CometStackerGUI(QMainWindow):
                                  "sirilpy is not available. This script must be run from Siril.")
             return
         
+        mode = self.stacking_mode_combo.currentText()
+        skip_calib = self.skip_calibration_check.isChecked()
+        
+        # Validate skip calibration has required files
+        if skip_calib:
+            base_seq = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+            process_dir = Path(self.working_dir) / "process"
+            registered_files = list(process_dir.glob(f"r_{base_seq}_*.fit"))
+            
+            if not registered_files:
+                QMessageBox.warning(
+                    self, "Missing Processed Files",
+                    "'Skip Calibration' is checked but no registered frames found "
+                    f"in process/ directory (expected r_{base_seq}_*.fit).\n\n"
+                    "Uncheck 'Skip Calibration' to run the full pipeline, "
+                    "or ensure preprocessing was completed previously."
+                )
+                return
+            
+            if mode in ("Comet Only", "Both (Stars + Comet)"):
+                comet_files = list(process_dir.glob(f"comet_r_{base_seq}_*.fit"))
+                if not comet_files:
+                    reply = QMessageBox.question(
+                        self, "No Comet Registration Found",
+                        "No comet-registered frames found in process/ directory.\n\n"
+                        "Comet registration must be completed in Siril before "
+                        "comet stacking can run.\n\n"
+                        "Continue anyway? (Star stacking will still work)",
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    if reply == QMessageBox.No:
+                        return
+        
         self.start_button.setEnabled(False)
         self.progress_bar.setValue(0)
         
@@ -761,10 +959,81 @@ class CometStackerGUI(QMainWindow):
         self.worker.finished.connect(self.on_processing_finished)
         self.worker.start()
     
+    def start_comet_stacking(self):
+        """Start comet stacking only (after manual comet registration)."""
+        if not self.working_dir:
+            QMessageBox.warning(self, "No Directory", "Please select a working directory first.")
+            return
+        
+        if not SIRILPY_AVAILABLE:
+            QMessageBox.critical(self, "Missing Dependency", 
+                                 "sirilpy is not available. This script must be run from Siril.")
+            return
+        
+        # Validate comet-registered files exist
+        base_seq = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+        process_dir = Path(self.working_dir) / "process"
+        comet_files = list(process_dir.glob(f"comet_r_{base_seq}_*.fit"))
+        
+        if not comet_files:
+            QMessageBox.warning(
+                self, "No Comet Registration",
+                f"No comet-registered frames found (expected comet_r_{base_seq}_*.fit "
+                f"in process/ directory).\n\n"
+                "Complete comet registration in Siril first:\n"
+                "1. Open the registered sequence in Siril\n"
+                "2. Go to Registration → Comet/Asteroid Registration\n"
+                "3. Mark the comet positions and click Register"
+            )
+            return
+        
+        self.stack_comet_btn.setEnabled(False)
+        self.start_button.setEnabled(False)
+        self.progress_bar.setValue(0)
+        
+        self.worker = SirilWorker(self.comet_stack_workflow)
+        self.worker.log_message.connect(self.log)
+        self.worker.progress_update.connect(self.progress_bar.setValue)
+        self.worker.finished.connect(self.on_comet_stacking_finished)
+        self.worker.start()
+    
+    def comet_stack_workflow(self, worker: SirilWorker):
+        """Comet stacking workflow executed in worker thread."""
+        try:
+            worker.log_message.emit("Using Siril instance...", "blue")
+            worker.siril = self.siril
+            worker.cmd("cd", self.working_dir)
+            worker.progress_update.emit(10)
+            
+            worker.log_message.emit("=== Stacking on Comet ===" , "green")
+            self.stack_comet(worker)
+            worker.progress_update.emit(100)
+            
+            worker.log_message.emit("Comet stacking complete!", "green")
+            worker.cmd("close")
+        except Exception as e:
+            worker.log_message.emit(f"Error in comet stacking: {e}", "red")
+            raise
+    
+    def on_comet_stacking_finished(self, success: bool, message: str):
+        """Handle comet stacking completion."""
+        self.start_button.setEnabled(True)
+        self.stack_comet_btn.setEnabled(True)
+        
+        if success:
+            QMessageBox.information(self, "Comet Stacking Complete",
+                                    "Comet-aligned stack saved to final_stack/comet_stacked.")
+        else:
+            QMessageBox.warning(self, "Comet Stacking Error", f"Stacking failed: {message}")
+    
     def process_workflow(self, worker: SirilWorker):
         """Main processing workflow executed in worker thread."""
         try:
-            # Use the Siril instance passed to the GUI
+            mode = self.stacking_mode_combo.currentText()
+            skip_calib = self.skip_calibration_check.isChecked()
+            worker.log_message.emit(f"Stacking mode: {mode}", "blue")
+            if skip_calib:
+                worker.log_message.emit("Skipping calibration (resume mode)", "blue")
             worker.log_message.emit("Using Siril instance...", "blue")
             worker.siril = self.siril
             
@@ -772,46 +1041,63 @@ class CometStackerGUI(QMainWindow):
             worker.cmd("cd", self.working_dir)
             worker.progress_update.emit(5)
             
-            # Process flats
-            if self.use_flats_check.isChecked():
-                worker.log_message.emit("=== Processing Flat Frames ===", "green")
-                self.process_flats(worker)
-                worker.progress_update.emit(20)
-            
-            # Process lights
-            worker.log_message.emit("=== Processing Light Frames ===", "green")
-            self.process_lights(worker)
-            worker.progress_update.emit(40)
-            
-            # Background extraction
-            if self.background_extract_check.isChecked():
-                worker.log_message.emit("=== Extracting Background ===", "green")
-                self.extract_background(worker)
-                worker.progress_update.emit(50)
-            
-            # Star registration
-            worker.log_message.emit("=== Registering on Stars ===", "green")
-            self.register_stars(worker)
-            worker.progress_update.emit(60)
+            # Calibration and registration (unless skipped)
+            if not skip_calib:
+                # Process flats
+                if self.use_flats_check.isChecked():
+                    worker.log_message.emit("=== Processing Flat Frames ===", "green")
+                    self.process_flats(worker)
+                    worker.progress_update.emit(20)
+                
+                # Process lights
+                worker.log_message.emit("=== Processing Light Frames ===", "green")
+                self.process_lights(worker)
+                worker.progress_update.emit(40)
+                
+                # Background extraction
+                if self.background_extract_check.isChecked():
+                    worker.log_message.emit("=== Extracting Background ===", "green")
+                    self.extract_background(worker)
+                    worker.progress_update.emit(50)
+                
+                # Star registration
+                worker.log_message.emit("=== Registering on Stars ===", "green")
+                self.register_stars(worker)
+                worker.progress_update.emit(60)
+                
+                # StarNet if enabled
+                if self.starnet_check.isChecked():
+                    worker.log_message.emit("=== Applying StarNet++ to Star-Registered Sequence ===", "green")
+                    self.apply_starnet_to_sequence(worker, "r")
+                    worker.progress_update.emit(65)
             
             # Star-aligned stack
-            worker.log_message.emit("=== Stacking on Stars ===", "green")
-            self.stack_stars(worker)
-            worker.progress_update.emit(70)
+            if mode in ("Stars Only", "Both (Stars + Comet)"):
+                worker.log_message.emit("=== Stacking on Stars ===", "green")
+                self.stack_stars(worker)
+                worker.progress_update.emit(70)
             
-            # Note about comet registration
-            worker.log_message.emit("", "black")
-            worker.log_message.emit("=== Manual Step Required ===", "salmon")
-            worker.log_message.emit("Go to 'Comet Selection' tab to complete comet registration", "salmon")
-            worker.log_message.emit("Then run comet stacking separately", "salmon")
-            
-            worker.progress_update.emit(80)
-            
-            # StarNet if enabled
-            if self.starnet_check.isChecked():
-                worker.log_message.emit("=== Applying StarNet++ ===", "green")
-                self.apply_starnet(worker)
-                worker.progress_update.emit(90)
+            # Comet-aligned stack or prompt for manual registration
+            if mode in ("Comet Only", "Both (Stars + Comet)"):
+                # Check if comet-registered files exist
+                base_seq = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+                process_dir = Path(self.working_dir) / "process"
+                comet_files = list(process_dir.glob(f"comet_r_{base_seq}_*.fit"))
+                
+                if comet_files:
+                    worker.log_message.emit("=== Stacking on Comet ===", "green")
+                    self.stack_comet(worker)
+                    worker.progress_update.emit(80)
+                else:
+                    worker.log_message.emit("", "black")
+                    worker.log_message.emit("=== Manual Step Required ===", "salmon")
+                    worker.log_message.emit("No comet-registered frames found.", "salmon")
+                    worker.log_message.emit("Go to 'Comet Selection' tab to identify comet positions,", "salmon")
+                    worker.log_message.emit("then complete comet registration in Siril,", "salmon")
+                    worker.log_message.emit("then click 'Stack Comet' to produce the comet-aligned stack.", "salmon")
+                    if self.starnet_check.isChecked():
+                        worker.log_message.emit("(Comet stack will use starless frames since StarNet is enabled)", "salmon")
+                    worker.progress_update.emit(80)
             
             # Animation if enabled
             if self.create_animation_check.isChecked():
@@ -904,53 +1190,90 @@ class CometStackerGUI(QMainWindow):
             sigma_low = self.star_sigma_low_spin.value()
             stack_cmd = f"stack r_{seq_name} rej {sigma_low} {sigma_high}"
         
-        worker.cmd(stack_cmd, "-norm=addscale", "-output_norm", "-rgb_equal",
+        worker.cmd(stack_cmd, "-norm=addscale",
                    "-out=../final_stack/stars_stacked")
         
+        worker.cmd("cd", "..")
+    
+    def apply_starnet_to_sequence(self, worker: SirilWorker, seq_prefix: str):
+        """Apply StarNet++ to all frames in a registered sequence.
+        
+        Args:
+            worker: SirilWorker instance for executing commands
+            seq_prefix: Prefix of the sequence (e.g., 'r_pp_light' or 'comet_r_pp_light')
+        """
+        worker.cmd("cd", "process")
+        
+        base_seq = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+        full_seq_name = f"{seq_prefix}_{base_seq}"
+        
+        # Get number of frames in sequence
+        process_dir = Path(self.working_dir) / "process"
+        seq_files = sorted(process_dir.glob(f"{full_seq_name}_*.fit"))
+        
+        if not seq_files:
+            worker.log_message.emit(f"No frames found for sequence {full_seq_name}", "salmon")
+            worker.cmd("cd", "..")
+            return
+        
+        worker.log_message.emit(f"Applying StarNet++ to {len(seq_files)} frames in {full_seq_name}...", "blue")
+        
+        # Process each frame
+        for i, fits_file in enumerate(seq_files, 1):
+            frame_name = fits_file.stem  # filename without extension
+            starless_name = f"starless_{frame_name}"
+            
+            try:
+                worker.cmd("load", f"{frame_name}.fit")
+                worker.cmd("starnet", "-stretch", "-nostarmask")
+                worker.cmd("save", f"{starless_name}.fit")
+                
+                if i % 10 == 0 or i == len(seq_files):
+                    worker.log_message.emit(f"  Processed {i}/{len(seq_files)} frames", "blue")
+            except Exception as e:
+                worker.log_message.emit(f"StarNet++ failed on frame {i}: {e}", "salmon")
+                worker.log_message.emit("StarNet++ may not be configured in Siril. Check Preferences > StarNet++", "salmon")
+                worker.cmd("cd", "..")
+                return
+        
+        worker.log_message.emit(f"StarNet++ complete: created starless_{full_seq_name} sequence", "green")
         worker.cmd("cd", "..")
     
     def stack_comet(self, worker: SirilWorker):
         """Stack frames aligned on comet (called separately after manual registration)."""
         worker.cmd("cd", "process")
         
-        seq_name = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+        base_seq = "bkg_pp_light" if self.background_extract_check.isChecked() else "pp_light"
+        
+        # Validate comet-registered files exist
+        process_dir = Path(self.working_dir) / "process"
+        comet_files = list(process_dir.glob(f"comet_r_{base_seq}_*.fit"))
+        if not comet_files:
+            worker.log_message.emit(
+                f"ERROR: No comet-registered frames found (comet_r_{base_seq}_*.fit). "
+                "Complete comet registration in Siril first.", "red"
+            )
+            worker.cmd("cd", "..")
+            return False
+        
+        # If StarNet is enabled, first apply it to the comet-registered sequence
+        if self.starnet_check.isChecked():
+            worker.log_message.emit("=== Applying StarNet++ to Comet-Registered Sequence ===", "green")
+            self.apply_starnet_to_sequence(worker, "comet_r")
+            seq_name = f"starless_comet_r_{base_seq}"
+        else:
+            seq_name = f"comet_r_{base_seq}"
+        
         rejection = self.rejection_combo.currentText()
         
         if rejection == "none":
-            stack_cmd = f"stack c_r_{seq_name} rej none"
+            stack_cmd = f"stack {seq_name} rej none"
         else:
             sigma_high = self.comet_sigma_high_spin.value()
             sigma_low = self.comet_sigma_low_spin.value()
-            stack_cmd = f"stack c_r_{seq_name} rej {sigma_low} {sigma_high}"
+            stack_cmd = f"stack {seq_name} rej {sigma_low} {sigma_high}"
         
         worker.cmd(stack_cmd, "-norm=addscale", "-out=../final_stack/comet_stacked")
-        
-        worker.cmd("cd", "..")
-    
-    def apply_starnet(self, worker: SirilWorker):
-        """Apply StarNet++ to remove stars."""
-        worker.cmd("cd", "final_stack")
-        
-        # Apply to star stack
-        if (Path(self.working_dir) / "final_stack" / "stars_stacked.fit").exists():
-            try:
-                worker.cmd("load", "stars_stacked.fit")
-                worker.cmd("starnet", "-stretch", "-nostarmask")
-                worker.cmd("save", "stars_stacked_starless.fit")
-                worker.log_message.emit("StarNet++ applied to stars_stacked.fit", "green")
-            except Exception as e:
-                worker.log_message.emit(f"StarNet++ failed on star stack: {e}", "salmon")
-                worker.log_message.emit("StarNet++ may not be configured in Siril. Check Preferences > StarNet++", "salmon")
-        
-        # Apply to comet stack if it exists
-        if (Path(self.working_dir) / "final_stack" / "comet_stacked.fit").exists():
-            try:
-                worker.cmd("load", "comet_stacked.fit")
-                worker.cmd("starnet", "-stretch", "-nostarmask")
-                worker.cmd("save", "comet_stacked_starless.fit")
-                worker.log_message.emit("StarNet++ applied to comet_stacked.fit", "green")
-            except Exception as e:
-                worker.log_message.emit(f"StarNet++ failed on comet stack: {e}", "salmon")
         
         worker.cmd("cd", "..")
     
@@ -1043,16 +1366,39 @@ class CometStackerGUI(QMainWindow):
         """Handle processing completion."""
         self.start_button.setEnabled(True)
         
-        if success:
-            QMessageBox.information(self, "Processing Complete", 
-                                    "Initial processing complete.\n\n"
-                                    "Go to 'Comet Selection' tab to:\n"
-                                    "1. Select frames for comet trajectory\n"
-                                    "2. Mark comet positions\n"
-                                    "3. Complete comet registration in Siril\n"
-                                    "4. Return to stack the comet")
-        else:
+        # Check for comet registration files (may have been created during processing)
+        self.check_comet_registration_exists()
+        
+        if not success:
             QMessageBox.warning(self, "Processing Error", f"Processing failed: {message}")
+            return
+        
+        mode = self.stacking_mode_combo.currentText()
+        if mode == "Stars Only":
+            QMessageBox.information(self, "Processing Complete",
+                                    "Star-aligned stack saved to final_stack/stars_stacked.")
+        elif mode in ("Comet Only", "Both (Stars + Comet)"):
+            # Check if comet stack was actually produced
+            comet_output = Path(self.working_dir) / "final_stack" / "comet_stacked.fit"
+            if comet_output.exists():
+                if mode == "Both (Stars + Comet)":
+                    QMessageBox.information(self, "Processing Complete",
+                                            "Both stacks complete:\n"
+                                            "  - Star-aligned: final_stack/stars_stacked\n"
+                                            "  - Comet-aligned: final_stack/comet_stacked")
+                else:
+                    QMessageBox.information(self, "Processing Complete",
+                                            "Comet-aligned stack saved to final_stack/comet_stacked.")
+            else:
+                # Comet stack not produced — switch to Comet Selection tab
+                self.tabs.setCurrentIndex(1)
+                QMessageBox.information(self, "Processing Complete", 
+                                        "Calibration and star registration complete.\n\n"
+                                        "To complete comet stacking:\n"
+                                        "1. Load first and last frames below\n"
+                                        "2. Mark comet positions in each frame\n"
+                                        "3. Click 'Register Comet' and complete registration in Siril\n"
+                                        "4. Click 'Stack Comet' to produce the comet-aligned stack")
     
     def save_preset(self):
         """Save current settings to preset file."""
@@ -1060,6 +1406,8 @@ class CometStackerGUI(QMainWindow):
             "bias_coefficient": self.bias_coeff_spin.value(),
             "use_flats": self.use_flats_check.isChecked(),
             "background_extraction": self.background_extract_check.isChecked(),
+            "skip_calibration": self.skip_calibration_check.isChecked(),
+            "stacking_mode": self.stacking_mode_combo.currentText(),
             "filter_roundness": {
                 "enabled": self.filter_round_check.isChecked(),
                 "value": self.filter_round_spin.value()
@@ -1106,6 +1454,12 @@ class CometStackerGUI(QMainWindow):
                 self.bias_coeff_spin.setValue(preset_data.get("bias_coefficient", 8))
                 self.use_flats_check.setChecked(preset_data.get("use_flats", True))
                 self.background_extract_check.setChecked(preset_data.get("background_extraction", False))
+                self.skip_calibration_check.setChecked(preset_data.get("skip_calibration", False))
+                
+                stacking_mode = preset_data.get("stacking_mode", "Both (Stars + Comet)")
+                mode_index = self.stacking_mode_combo.findText(stacking_mode)
+                if mode_index >= 0:
+                    self.stacking_mode_combo.setCurrentIndex(mode_index)
                 
                 filter_round = preset_data.get("filter_roundness", {})
                 self.filter_round_check.setChecked(filter_round.get("enabled", False))

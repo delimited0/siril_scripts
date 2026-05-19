@@ -38,7 +38,8 @@ calibrate light -bias="=8*$OFFSET" -flat=pp_flat_stacked -cfa -equalize_cfa -deb
 register pp_light
 
 # Stack calibrated lights to result.fit
-stack r_pp_light rej 3 3 -norm=addscale -output_norm -out=../result
+# stack r_pp_light rej 3 3 -norm=addscale -out=../result
+stack r_pp_light rej 3 3 -nonorm -out=../result
 
 cd ..
 close
