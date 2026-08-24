@@ -193,6 +193,7 @@ WB_PATCH_INDEX = {
     "Neutral 5": 21,
     "Neutral 3.5": 22,
 }
+WB_REFERENCE_CHANNELS = {"R": 0, "G": 1}
 
 ORIENTATION_OPTIONS = [
     ("Upright", 0),
@@ -525,13 +526,18 @@ def sample_colorchecker_patches(
     return np.stack(patch_samples, axis=0)
 
 
-def white_balance_from_patch(rgb: np.ndarray) -> np.ndarray:
-    """Build a white-balance vector with green fixed at 1.0."""
+def white_balance_from_patch(rgb: np.ndarray, reference_channel: str = "G") -> np.ndarray:
+    """Build a white-balance vector normalized to R or G."""
+    try:
+        reference_index = WB_REFERENCE_CHANNELS[reference_channel]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported white-balance reference channel: {reference_channel}") from exc
+
     values = np.asarray(rgb, dtype=np.float64)
     if np.any(~np.isfinite(values)) or np.any(values <= 0):
         raise ValueError("White-balance patch must contain finite positive RGB values")
-    green = float(values[1])
-    return np.array([green / values[0], 1.0, green / values[2]], dtype=np.float64)
+    reference = float(values[reference_index])
+    return reference / values
 
 
 def lab_to_xyz(lab: np.ndarray) -> np.ndarray:
@@ -779,12 +785,14 @@ def format_matrix_markdown(
 def format_output_markdown(
     reference_name: str,
     wb_patch_label: str,
+    wb_reference_channel: str,
     result: CalibrationResult,
 ) -> str:
     """Build the final copy-pastable markdown report."""
     sections = [
         f"Reference: **{reference_name}**",
         f"White-balance patch: **{wb_patch_label}**",
+        f"White-balance reference channel: **{wb_reference_channel} = 1.0**",
         f"Fit quality: **mean dE00 {result.mean_delta_e:.3f}**, **max dE00 {result.max_delta_e:.3f}**",
         "",
         format_vector_markdown("White Balance Vector", result.wb_vector),
@@ -810,7 +818,7 @@ def format_output_markdown(
             "Do not white-balance first and then also use the one-step matrix."
         ),
         (
-            f"The Siril-ready matrices are brightness-scaled by the selected WB patch green value "
+            f"The Siril-ready matrices are brightness-scaled by the selected WB patch {wb_reference_channel} value "
             f"(`{result.siril_output_scale:.3f}`) so the coefficients stay practical for Siril's GUI."
         ),
         "The intermediate XYZ matrices are still included for reference. Combined XYZ is `Forward × diag(WB)`.",
@@ -1356,6 +1364,12 @@ class ForwardMatrixGUI(QMainWindow):
         options_layout.addWidget(QLabel("WB Patch:"), 1, 0)
         options_layout.addWidget(self.wb_patch_combo, 1, 1)
 
+        self.wb_reference_combo = QComboBox()
+        self.wb_reference_combo.addItems(list(WB_REFERENCE_CHANNELS.keys()))
+        self.wb_reference_combo.setCurrentText("G")
+        options_layout.addWidget(QLabel("WB Reference:"), 2, 0)
+        options_layout.addWidget(self.wb_reference_combo, 2, 1)
+
         self.patch_sample_spin = QDoubleSpinBox()
         self.patch_sample_spin.setRange(10.0, 95.0)
         self.patch_sample_spin.setDecimals(1)
@@ -1377,7 +1391,7 @@ class ForwardMatrixGUI(QMainWindow):
         self.summary_label = QLabel("Crop the chart, then compute the matrix.")
         self.summary_label.setStyleSheet("font-weight: bold;")
         self.summary_label.setWordWrap(True)
-        options_layout.addWidget(self.summary_label, 2, 0, 1, 4)
+        options_layout.addWidget(self.summary_label, 3, 0, 1, 4)
 
         options_group.setLayout(options_layout)
         main_layout.addWidget(options_group)
@@ -1511,6 +1525,10 @@ class ForwardMatrixGUI(QMainWindow):
         """Return the selected neutral patch index."""
         return WB_PATCH_INDEX[self.wb_patch_combo.currentText()]
 
+    def selected_wb_reference_channel(self) -> str:
+        """Return the selected white-balance reference channel."""
+        return self.wb_reference_combo.currentText()
+
     def patch_sample_fraction(self) -> float:
         """Return the fraction of each patch cell used for color sampling."""
         return clamp_patch_sample_fraction(self.patch_sample_spin.value() / 100.0)
@@ -1543,9 +1561,11 @@ class ForwardMatrixGUI(QMainWindow):
             crop_rgb = crop_array(self.loaded_image.rgb, crop_rect)
             sampled_rgb = sample_colorchecker_patches(crop_rgb, self.orientation_value(), self.patch_sample_fraction())
             wb_patch_index = self.selected_wb_patch_index()
-            wb_vector = white_balance_from_patch(sampled_rgb[wb_patch_index])
+            wb_reference_channel = self.selected_wb_reference_channel()
+            wb_reference_index = WB_REFERENCE_CHANNELS[wb_reference_channel]
+            wb_vector = white_balance_from_patch(sampled_rgb[wb_patch_index], wb_reference_channel)
             wb_reference_rgb = sampled_rgb[wb_patch_index] * wb_vector
-            siril_output_scale = float(wb_reference_rgb[1])
+            siril_output_scale = float(wb_reference_rgb[wb_reference_index])
             result = solve_forward_matrix(sampled_rgb, self.selected_reference_lab(), wb_vector, siril_output_scale)
         except Exception as exc:
             QMessageBox.critical(self, "Computation Error", str(exc))
@@ -1554,6 +1574,7 @@ class ForwardMatrixGUI(QMainWindow):
         markdown = format_output_markdown(
             self.reference_combo.currentText(),
             self.wb_patch_combo.currentText(),
+            self.selected_wb_reference_channel(),
             result,
         )
         self.output_text.setPlainText(markdown)
@@ -1571,6 +1592,7 @@ class ForwardMatrixGUI(QMainWindow):
             "reference": self.reference_combo.currentText(),
             "orientation_index": self.orientation_combo.currentIndex(),
             "wb_patch": self.wb_patch_combo.currentText(),
+            "wb_reference_channel": self.wb_reference_combo.currentText(),
             "patch_sample_percent": self.patch_sample_spin.value(),
         }
         try:
@@ -1599,6 +1621,10 @@ class ForwardMatrixGUI(QMainWindow):
         wb_patch = settings.get("wb_patch")
         if wb_patch in WB_PATCH_INDEX:
             self.wb_patch_combo.setCurrentText(wb_patch)
+
+        wb_reference_channel = settings.get("wb_reference_channel")
+        if wb_reference_channel in WB_REFERENCE_CHANNELS:
+            self.wb_reference_combo.setCurrentText(wb_reference_channel)
 
         patch_sample_percent = settings.get("patch_sample_percent")
         if patch_sample_percent is not None:
