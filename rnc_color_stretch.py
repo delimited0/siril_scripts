@@ -91,8 +91,8 @@ if SIRILPY_AVAILABLE:
 
 from astropy.io import fits
 from PIL import Image
-from PyQt5.QtCore import QPoint, QRect, QThread, QTimer, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QTextCursor
+from PyQt5.QtCore import QPoint, QPointF, QRect, QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -170,7 +170,7 @@ PARAMETER_TOOLTIPS = {
         "It can over-brighten data that is already well exposed."
     ),
     "sky": (
-        "Fraction of the smoothed histogram peak used to find the dark-sky level on the left side of the histogram. "
+        "Clark's -skylevelfactor: fraction of the smoothed histogram peak used to find the dark-sky level on the left side. "
         "Lower values search farther into the shadows and usually subtract less background. "
         "Higher values choose a brighter sky point and can make the background darker or clip faint signal."
     ),
@@ -187,35 +187,34 @@ PARAMETER_TOOLTIPS = {
         "Higher values leave a brighter/bluer background; lower values push blue shadows darker."
     ),
     "zero_rgb": (
-        "Master control for the red, green, and blue zero-sky levels. "
+        "Convenience control for Clark's final-image RGB sky zero (-rgbskyzero). "
         "Moving this slider sets all three channel sliders together; the individual channel sliders can still be adjusted afterward."
     ),
     "rootpower": (
-        "Main root stretch exponent denominator. The algorithm applies output = input^(1/root power) after sky subtraction. "
+        "Clark's -rootpower power factor. The algorithm applies output = input^(1/power factor) after sky subtraction. "
         "Higher values brighten shadows and faint nebulosity more strongly; lower values are milder."
     ),
     "rootpower2": (
-        "Root power used on additional root-stretch passes after the first. "
-        "Only matters when root iterations is greater than 1. Higher values make later passes more aggressive."
+        "Clark's -rootpower2 power factor for the second rootpower–sky iteration. "
+        "A value of 1 means reuse the first power factor, matching Clark's default. Higher values make later passes more aggressive."
     ),
     "rootiter": (
-        "Number of root-stretch and sky-rebalance passes. "
+        "Clark's -rootiter: number of rootpower–sky iterations. "
         "More passes can reveal faint signal but can also amplify noise and make the image look harsh."
     ),
     "s_curve": (
-        "Optional contrast curve after the root stretch. "
-        "S-curve 1 increases contrast around midtones and darkens low levels; S-curve 2 brightens more broadly with less low-end effect. "
-        "Stacked options apply both."
+        "Clark's final S-curve sequence: -scurve1 applies curve 1; -scurve2 applies 1 then 2; "
+        "-scurve3 applies 1, 2, 1; and -scurve4 applies 1, 2, 1, 2."
     ),
     "color_correction": (
-        "Color recovery method after stretching: none, ratio recovery, or HSV recovery from the original hue/saturation."
+        "Color recovery after stretching. Clark's method is ratio recovery; HSV recovery is a Siril-app extension."
     ),
     "color_enhance": (
-        "Multiplier for the signal-dependent color recovery. "
+        "Clark's -enhance color enhancement factor for signal-dependent color recovery. "
         "Higher values increase saturation/color recovery, especially in brighter structures; lower values reduce color correction and noise risk."
     ),
     "setmin": (
-        "Raises pixels below the selected minimum levels. "
+        "Clark's -setmin control raises pixels below the selected minimum output levels. "
         "This can hide very dark color artifacts or chromatic star halos, but too much will lift the black floor."
     ),
     "min_r": (
@@ -309,6 +308,20 @@ class LoadedImage:
 class StretchResult:
     rgb: np.ndarray
     log: str
+    histograms: Tuple["HistogramSnapshot", ...] = ()
+
+
+@dataclass(frozen=True)
+class HistogramSnapshot:
+    key: str
+    label: str
+    raw_rgb: np.ndarray
+    smoothed_rgb: np.ndarray
+    peaks: Tuple[int, int, int]
+    sky_levels: Optional[Tuple[int, int, int]]
+    target_zero: Tuple[int, int, int]
+    threshold_count: Optional[float]
+    region: Tuple[int, int, int, int]
 
 
 class ParameterSlider(QWidget):
@@ -572,7 +585,13 @@ def result_rgb_to_siril_data(rgb: np.ndarray, source: LoadedImage) -> np.ndarray
     if "uint16" in dtype_name:
         converted = np.clip(np.rint(data), 0, 65535).astype(np.uint16)
     else:
-        converted = np.clip(data, 0.0, 1.0).astype(np.float32)
+        # The stretch core works in 16-bit DN. restore_source_scale normally
+        # returns 0..1 for Siril floats, but HDR inputs can have a source max
+        # above 1 and therefore retain DN scale. Normalize instead of clipping
+        # nearly every positive pixel to white.
+        maximum = float(np.nanmax(data)) if data.size else 0.0
+        normalized = data / 65535.0 if maximum > 1.00001 else data
+        converted = np.clip(normalized, 0.0, 1.0).astype(np.float32)
 
     shape = source.siril_data_shape or source.original_shape
     if len(shape) == 2:
@@ -587,6 +606,55 @@ def result_rgb_to_siril_data(rgb: np.ndarray, source: LoadedImage) -> np.ndarray
     if len(shape) == 3 and shape[-1] == 3:
         return np.ascontiguousarray(converted[:, :, :3])
     return np.ascontiguousarray(np.moveaxis(converted[:, :, :3], -1, 0))
+
+
+def images_match_for_apply(preview: Optional[LoadedImage], active: LoadedImage) -> bool:
+    """Return whether the active Siril image is the image represented by the preview."""
+    if preview is None or not preview.source_is_current:
+        return False
+    identity_matches = (
+        tuple(active.original_shape) == tuple(preview.original_shape)
+        and active.path.name == preview.path.name
+    )
+    if not identity_matches or active.preview_input.shape != preview.preview_input.shape:
+        return False
+    return bool(np.allclose(active.preview_input, preview.preview_input, rtol=1e-6, atol=2e-7, equal_nan=True))
+
+
+def verify_siril_pixeldata(expected: np.ndarray, actual: np.ndarray) -> None:
+    """Verify a Siril write using shape, dtype, and representative samples."""
+    expected_array = np.asarray(expected)
+    actual_array = np.asarray(actual)
+    if actual_array.shape != expected_array.shape:
+        raise ValueError(f"Siril read-back shape {actual_array.shape} does not match {expected_array.shape}")
+    if (
+        actual_array.dtype.kind != expected_array.dtype.kind
+        or actual_array.dtype.itemsize != expected_array.dtype.itemsize
+    ):
+        raise ValueError(f"Siril read-back dtype {actual_array.dtype} does not match {expected_array.dtype}")
+    expected_flat = expected_array.reshape(-1)
+    actual_flat = actual_array.reshape(-1)
+    indexes = np.linspace(0, max(expected_flat.size - 1, 0), min(4096, expected_flat.size), dtype=np.int64)
+    if expected_array.dtype == np.uint16:
+        matches = np.array_equal(actual_flat[indexes], expected_flat[indexes])
+    else:
+        matches = np.allclose(actual_flat[indexes], expected_flat[indexes], rtol=1e-6, atol=2e-7)
+    if not matches:
+        raise ValueError("Siril read-back pixels do not match the stretched result")
+
+
+def write_result_to_siril(siril, source: LoadedImage, rgb: np.ndarray):
+    """Commit stretched pixels to Siril, create undo state, and verify read-back."""
+    siril_data = result_rgb_to_siril_data(rgb, source)
+    with siril.image_lock():
+        if hasattr(siril, "undo_save_state"):
+            siril.undo_save_state("RNC color stretch")
+        siril.set_image_pixeldata(siril_data)
+    readback_fit = siril.get_image(with_pixels=True, preview=False)
+    if getattr(readback_fit, "data", None) is None:
+        raise RuntimeError("Siril returned no pixel data after Apply")
+    verify_siril_pixeldata(siril_data, np.asarray(readback_fit.data))
+    return readback_fit
 
 
 def choose_preview_downsample(shape: Sequence[int]) -> int:
@@ -695,6 +763,38 @@ def selected_sky_region(img: np.ndarray, params: StretchParameters, lines: list[
     raise ValueError(f"Unknown sky region mode: {params.sky_region_mode}")
 
 
+def make_histogram_snapshot(
+    img: np.ndarray,
+    params: StretchParameters,
+    key: str,
+    label: str,
+    *,
+    region: Optional[Tuple[int, int, int, int]] = None,
+    sky_levels: Optional[Sequence[int]] = None,
+    threshold_count: Optional[float] = None,
+) -> HistogramSnapshot:
+    """Capture Clark-style RGB histograms for one processing stage."""
+    if region is None:
+        region = selected_sky_region(img, params, [])
+    x1, y1, x2, y2 = region
+    selected = np.asarray(img)[y1:y2, x1:x2, :]
+    raw = np.stack([histogram_channel(selected, channel) for channel in range(3)], axis=0)
+    smoothed = np.stack([smooth_histogram(raw[channel]) for channel in range(3)], axis=0)
+    peaks = tuple(int(np.argmax(smoothed[channel, 400:65501]) + 400) for channel in range(3))
+    sky_tuple = tuple(int(value) for value in sky_levels) if sky_levels is not None else None
+    return HistogramSnapshot(
+        key=key,
+        label=label,
+        raw_rgb=raw,
+        smoothed_rgb=smoothed,
+        peaks=peaks,
+        sky_levels=sky_tuple,
+        target_zero=(int(params.zerosky_r), int(params.zerosky_g), int(params.zerosky_b)),
+        threshold_count=float(threshold_count) if threshold_count is not None else None,
+        region=(int(x1), int(y1), int(x2), int(y2)),
+    )
+
+
 def append_stats(lines: list[str], label: str, img: np.ndarray) -> None:
     mins = np.nanmin(img, axis=(0, 1))
     maxs = np.nanmax(img, axis=(0, 1))
@@ -716,6 +816,7 @@ def smooth_and_subtract(
     lines: list[str],
     label: str,
     passes: int = 2,
+    snapshots: Optional[list[HistogramSnapshot]] = None,
 ) -> np.ndarray:
     img = np.array(in_img, dtype=np.float32, copy=True)
     x1, y1, x2, y2 = selected_sky_region(img, params, lines)
@@ -750,6 +851,20 @@ def smooth_and_subtract(
                 )
             sky_indexes.append(sky_index)
 
+        if snapshots is not None:
+            stage_base = f"{label.replace(' ', '_')}_sky_{pass_index + 1}"
+            snapshots.append(
+                make_histogram_snapshot(
+                    img,
+                    params,
+                    f"{stage_base}_analysis",
+                    f"{label.title()} — sky analysis {pass_index + 1}",
+                    region=(x1, y1, x2, y2),
+                    sky_levels=sky_indexes,
+                    threshold_count=green_target,
+                )
+            )
+
         zeros = np.array([params.zerosky_r, params.zerosky_g, params.zerosky_b], dtype=np.float32)
         subtract = np.array(sky_indexes, dtype=np.float32) - zeros
         denom = np.maximum(65535.0 - subtract, 1.0)
@@ -759,14 +874,31 @@ def smooth_and_subtract(
             f"{label} sky pass {pass_index + 1}: peaks RGB {peaks}, "
             f"sky RGB {sky_indexes}, subtract RGB {[int(v) for v in subtract]}"
         )
+        if snapshots is not None:
+            stage_key = f"{label.replace(' ', '_')}_sky_{pass_index + 1}_adjusted"
+            snapshots.append(
+                make_histogram_snapshot(
+                    img,
+                    params,
+                    stage_key,
+                    f"{label.title()} — after sky adjustment {pass_index + 1}",
+                    region=(x1, y1, x2, y2),
+                )
+            )
     return img
 
 
-def root_stretch(in_img: np.ndarray, params: StretchParameters, lines: list[str]) -> np.ndarray:
+def root_stretch(
+    in_img: np.ndarray,
+    params: StretchParameters,
+    lines: list[str],
+    snapshots: Optional[list[HistogramSnapshot]] = None,
+) -> np.ndarray:
     img = np.array(in_img, dtype=np.float32, copy=True)
     powers = [params.rootpower]
     if params.rootiter >= 2:
-        powers.extend([params.rootpower2] * (params.rootiter - 1))
+        later_power = params.rootpower if params.rootpower2 <= 1 else params.rootpower2
+        powers.extend([later_power] * (params.rootiter - 1))
     for index, power in enumerate(powers[: params.rootiter], start=1):
         exponent = 1.0 / float(max(power, 1))
         stretched = 65535.0 * (((img + 1.0) / 65536.0) ** exponent)
@@ -774,12 +906,25 @@ def root_stretch(in_img: np.ndarray, params: StretchParameters, lines: list[str]
         stretched = (stretched - float(minimum)) / max(65535.0 - float(minimum), 1.0)
         img = np.clip(65535.0 * stretched, 0.0, 65535.0)
         lines.append(f"Root stretch pass {index}: power {power}, subtracted minimum {minimum}")
+        if snapshots is not None:
+            snapshots.append(
+                make_histogram_snapshot(
+                    img, params, f"root_{index}_before_sky", f"Root iteration {index} — before sky adjustment"
+                )
+            )
         sky_passes = 3 if power > 60 else 2
-        img = smooth_and_subtract(img, params, lines, f"root pass {index}", passes=sky_passes)
+        img = smooth_and_subtract(
+            img, params, lines, f"root pass {index}", passes=sky_passes, snapshots=snapshots
+        )
     return img
 
 
-def asinh_stretch(in_img: np.ndarray, params: StretchParameters, lines: list[str]) -> np.ndarray:
+def asinh_stretch(
+    in_img: np.ndarray,
+    params: StretchParameters,
+    lines: list[str],
+    snapshots: Optional[list[HistogramSnapshot]] = None,
+) -> np.ndarray:
     img = np.array(in_img, dtype=np.float32, copy=True)
     factors = [params.asinh_k1]
     if params.asinh_iter >= 2:
@@ -791,12 +936,25 @@ def asinh_stretch(in_img: np.ndarray, params: StretchParameters, lines: list[str
         stretched = (stretched - float(minimum)) / max(65535.0 - float(minimum), 1.0)
         img = np.clip(65535.0 * stretched, 0.0, 65535.0)
         lines.append(f"ASINH stretch pass {index}: K {factor}, subtracted minimum {minimum}")
+        if snapshots is not None:
+            snapshots.append(
+                make_histogram_snapshot(
+                    img, params, f"asinh_{index}_before_sky", f"ASINH iteration {index} — before sky adjustment"
+                )
+            )
         sky_passes = 3 if factor > 100 else 2
-        img = smooth_and_subtract(img, params, lines, f"asinh pass {index}", passes=sky_passes)
+        img = smooth_and_subtract(
+            img, params, lines, f"asinh pass {index}", passes=sky_passes, snapshots=snapshots
+        )
     return img
 
 
-def log_stretch(in_img: np.ndarray, params: StretchParameters, lines: list[str]) -> np.ndarray:
+def log_stretch(
+    in_img: np.ndarray,
+    params: StretchParameters,
+    lines: list[str],
+    snapshots: Optional[list[HistogramSnapshot]] = None,
+) -> np.ndarray:
     img = np.array(in_img, dtype=np.float32, copy=True)
     factors = [params.log_k1]
     if params.log_iter >= 2:
@@ -809,12 +967,25 @@ def log_stretch(in_img: np.ndarray, params: StretchParameters, lines: list[str])
         stretched = (stretched - float(minimum)) / max(65535.0 - float(minimum), 1.0)
         img = np.clip(65535.0 * stretched, 0.0, 65535.0)
         lines.append(f"Log stretch pass {index}: K {factor}, subtracted minimum {minimum}")
+        if snapshots is not None:
+            snapshots.append(
+                make_histogram_snapshot(
+                    img, params, f"log_{index}_before_sky", f"Log iteration {index} — before sky adjustment"
+                )
+            )
         sky_passes = 3 if factor > 100 else 2
-        img = smooth_and_subtract(img, params, lines, f"log pass {index}", passes=sky_passes)
+        img = smooth_and_subtract(
+            img, params, lines, f"log pass {index}", passes=sky_passes, snapshots=snapshots
+        )
     return img
 
 
-def s_curve(in_img: np.ndarray, params: StretchParameters, lines: list[str]) -> np.ndarray:
+def s_curve(
+    in_img: np.ndarray,
+    params: StretchParameters,
+    lines: list[str],
+    snapshots: Optional[list[HistogramSnapshot]] = None,
+) -> np.ndarray:
     img = np.array(in_img, dtype=np.float32, copy=True)
     for index in range(params.s_curve):
         if index + 1 in (2, 4):
@@ -834,7 +1005,9 @@ def s_curve(in_img: np.ndarray, params: StretchParameters, lines: list[str]) -> 
         img = 65535.0 * sc / (1.0 - scurveminsc)
         lines.append(f"S-curve pass {index + 1}: factor {xfactor:.1f}, offset {xoffset:.2f}")
 
-    return smooth_and_subtract(img, params, lines, "s-curve")
+    if snapshots is not None:
+        snapshots.append(make_histogram_snapshot(img, params, "s_curve_before_sky", "S-curve — before sky adjustment"))
+    return smooth_and_subtract(img, params, lines, "s-curve", snapshots=snapshots)
 
 
 def set_minimum(in_img: np.ndarray, params: StretchParameters) -> np.ndarray:
@@ -1112,8 +1285,14 @@ def richardson_lucy_deconvolution(in_img: np.ndarray, params: StretchParameters,
     return result.astype(np.float32)
 
 
-def apply_rnc_stretch(source_rgb: np.ndarray, params: StretchParameters) -> StretchResult:
+def apply_rnc_stretch(
+    source_rgb: np.ndarray,
+    params: StretchParameters,
+    *,
+    capture_histograms: bool = True,
+) -> StretchResult:
     lines: list[str] = []
+    snapshots: Optional[list[HistogramSnapshot]] = [] if capture_histograms else None
     img = scale_to_16bit_range(source_rgb)
     append_stats(lines, "Input scaled to 16-bit range", img)
 
@@ -1133,31 +1312,35 @@ def apply_rnc_stretch(source_rgb: np.ndarray, params: StretchParameters) -> Stre
         img = tone_curve(img)
         append_stats(lines, "After tone curve", img)
 
-    img = smooth_and_subtract(img, params, lines, "initial")
+    if snapshots is not None:
+        snapshots.append(make_histogram_snapshot(img, params, "input", "Input to histogram analysis"))
+    img = smooth_and_subtract(img, params, lines, "initial", snapshots=snapshots)
     append_stats(lines, "After initial sky subtraction", img)
     original_subtracted = img.copy()
 
     if params.stretch_type == "none":
         lines.append("Stretch: none")
     elif params.stretch_type == "root":
-        img = root_stretch(img, params, lines)
+        img = root_stretch(img, params, lines, snapshots)
         append_stats(lines, "After root stretch", img)
     elif params.stretch_type == "asinh":
-        img = asinh_stretch(img, params, lines)
+        img = asinh_stretch(img, params, lines, snapshots)
         append_stats(lines, "After ASINH stretch", img)
     elif params.stretch_type == "log":
-        img = log_stretch(img, params, lines)
+        img = log_stretch(img, params, lines, snapshots)
         append_stats(lines, "After log stretch", img)
     else:
         raise ValueError(f"Unknown stretch type: {params.stretch_type}")
 
     if params.s_curve > 0:
-        img = s_curve(img, params, lines)
+        img = s_curve(img, params, lines, snapshots)
         append_stats(lines, "After S-curve", img)
 
     if params.setmin:
         img = set_minimum(img, params)
         append_stats(lines, "After set minimum", img)
+        if snapshots is not None:
+            snapshots.append(make_histogram_snapshot(img, params, "minimum_output", "After minimum output levels"))
 
     if params.color_correction_mode == "ratio":
         img = color_correct(img, original_subtracted, params, lines)
@@ -1167,6 +1350,9 @@ def apply_rnc_stretch(source_rgb: np.ndarray, params: StretchParameters) -> Stre
         append_stats(lines, "After HSV color correction", img)
     elif params.color_correction_mode != "none":
         raise ValueError(f"Unknown color correction mode: {params.color_correction_mode}")
+
+    if snapshots is not None:
+        snapshots.append(make_histogram_snapshot(img, params, "color_recovery", "After color recovery"))
 
     img = hsv_adjust(img, params, lines)
     if params.hsv_adjust:
@@ -1190,7 +1376,13 @@ def apply_rnc_stretch(source_rgb: np.ndarray, params: StretchParameters) -> Stre
 
     img = np.clip(img, 0.0, 65535.0)
     append_stats(lines, "Output", img)
-    return StretchResult(rgb=restore_source_scale(img, source_rgb), log="\n".join(lines))
+    if snapshots is not None:
+        snapshots.append(make_histogram_snapshot(img, params, "final", "Final output"))
+    return StretchResult(
+        rgb=restore_source_scale(img, source_rgb),
+        log="\n".join(lines),
+        histograms=tuple(snapshots or ()),
+    )
 
 
 def linear_display_limits(rgb: np.ndarray, original_dtype: str = "") -> Tuple[float, float]:
@@ -1244,6 +1436,163 @@ def save_result_fits(path: Path, rgb: np.ndarray, source: LoadedImage, params: S
     header["HISTORY"] = "Saved as normalized 32-bit float data in the 0..1 range for Siril."
     data = np.moveaxis(rgb_data, -1, 0)
     fits.PrimaryHDU(data=data, header=header).writeto(path, overwrite=True)
+
+
+class HistogramPlot(QWidget):
+    """Dependency-free RGB histogram plot with Clark-style axes and markers."""
+
+    CHANNEL_COLORS = (QColor(235, 80, 80), QColor(80, 220, 110), QColor(80, 140, 255))
+
+    def __init__(self):
+        super().__init__()
+        self.snapshot: Optional[HistogramSnapshot] = None
+        self.use_smoothed = True
+        self.log_counts = False
+        self.x_min = 0.0
+        self.x_max = 65535.0
+        self.drag_start: Optional[QPoint] = None
+        self.drag_range = (0.0, 65535.0)
+        self.setMinimumSize(500, 360)
+        self.setMouseTracking(True)
+
+    def set_snapshot(self, snapshot: Optional[HistogramSnapshot]) -> None:
+        self.snapshot = snapshot
+        self.update()
+
+    def set_smoothed(self, enabled: bool) -> None:
+        self.use_smoothed = bool(enabled)
+        self.update()
+
+    def set_log_counts(self, enabled: bool) -> None:
+        self.log_counts = bool(enabled)
+        self.update()
+
+    def reset_range(self) -> None:
+        self.x_min, self.x_max = 0.0, 65535.0
+        self.update()
+
+    def _plot_rect(self) -> QRect:
+        return self.rect().adjusted(72, 24, -24, -58)
+
+    def _x_pixel(self, value: float, plot: QRect) -> float:
+        fraction = (value - self.x_min) / max(self.x_max - self.x_min, 1.0)
+        return plot.left() + fraction * plot.width()
+
+    def _display_counts(self) -> Optional[np.ndarray]:
+        if self.snapshot is None:
+            return None
+        values = self.snapshot.smoothed_rgb if self.use_smoothed else self.snapshot.raw_rgb
+        values = np.asarray(values, dtype=np.float64)
+        return np.log1p(values) if self.log_counts else values
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(18, 18, 18))
+        plot = self._plot_rect()
+        painter.setPen(QPen(QColor(155, 155, 155), 1))
+        painter.drawRect(plot)
+        painter.drawText(QRect(plot.left(), plot.bottom() + 28, plot.width(), 24), Qt.AlignCenter, "Image Data DN Level")
+        painter.save()
+        painter.translate(18, plot.center().y())
+        painter.rotate(-90)
+        painter.drawText(QRect(-plot.height() // 2, -12, plot.height(), 24), Qt.AlignCenter, "Number of Pixels")
+        painter.restore()
+
+        counts = self._display_counts()
+        if counts is None:
+            painter.drawText(plot, Qt.AlignCenter, "No histogram available")
+            return
+
+        start = max(0, int(np.floor(self.x_min)))
+        stop = min(65536, int(np.ceil(self.x_max)) + 1)
+        visible = counts[:, start:stop]
+        y_max = float(np.max(visible)) if visible.size else 0.0
+        if y_max <= 0.0 or not np.isfinite(y_max):
+            return
+
+        width = max(2, plot.width())
+        edges = np.linspace(start, stop, width + 1, dtype=np.int64)
+        for channel, color in enumerate(self.CHANNEL_COLORS):
+            points = QPolygonF()
+            channel_values = counts[channel]
+            for column in range(width):
+                left = int(edges[column])
+                right = max(left + 1, int(edges[column + 1]))
+                value = float(np.max(channel_values[left:min(right, 65536)]))
+                x = plot.left() + column
+                y = plot.bottom() - (value / y_max) * plot.height()
+                points.append(QPointF(float(x), float(y)))
+            painter.setPen(QPen(color, 1.4))
+            painter.drawPolyline(points)
+
+        snapshot = self.snapshot
+        assert snapshot is not None
+        for channel, peak in enumerate(snapshot.peaks):
+            if self.x_min <= peak <= self.x_max:
+                painter.setPen(QPen(self.CHANNEL_COLORS[channel], 1, Qt.DotLine))
+                x = int(round(self._x_pixel(peak, plot)))
+                painter.drawLine(x, plot.top(), x, plot.bottom())
+        if snapshot.sky_levels is not None:
+            for channel, level in enumerate(snapshot.sky_levels):
+                if self.x_min <= level <= self.x_max:
+                    marker = QColor(self.CHANNEL_COLORS[channel])
+                    marker.setAlpha(210)
+                    painter.setPen(QPen(marker, 2, Qt.DashLine))
+                    x = int(round(self._x_pixel(level, plot)))
+                    painter.drawLine(x, plot.top(), x, plot.bottom())
+        for level in sorted(set(snapshot.target_zero)):
+            if self.x_min <= level <= self.x_max:
+                painter.setPen(QPen(QColor(220, 220, 220, 180), 1, Qt.DashDotLine))
+                x = int(round(self._x_pixel(level, plot)))
+                painter.drawLine(x, plot.top(), x, plot.bottom())
+        if snapshot.threshold_count is not None:
+            threshold = math.log1p(snapshot.threshold_count) if self.log_counts else snapshot.threshold_count
+            y = int(round(plot.bottom() - min(float(threshold) / y_max, 1.0) * plot.height()))
+            painter.setPen(QPen(QColor(230, 205, 80, 190), 1, Qt.DashLine))
+            painter.drawLine(plot.left(), y, plot.right(), y)
+
+        painter.setPen(QColor(210, 210, 210))
+        painter.drawText(plot.left(), plot.bottom() + 18, f"{int(self.x_min)}")
+        right_label = f"{int(self.x_max)}"
+        painter.drawText(plot.right() - painter.fontMetrics().horizontalAdvance(right_label), plot.bottom() + 18, right_label)
+        legend = "R   G   B    dotted: peak   dashed: detected sky   gray: target sky zero"
+        painter.drawText(QRect(plot.left(), 2, plot.width(), 20), Qt.AlignLeft | Qt.AlignVCenter, legend)
+
+    def wheelEvent(self, event) -> None:
+        plot = self._plot_rect()
+        if not plot.contains(event.pos()):
+            return
+        current_width = self.x_max - self.x_min
+        factor = 0.8 if event.angleDelta().y() > 0 else 1.25
+        new_width = float(np.clip(current_width * factor, 64.0, 65535.0))
+        anchor = float(np.clip((event.pos().x() - plot.left()) / max(plot.width(), 1), 0.0, 1.0))
+        center_value = self.x_min + anchor * current_width
+        new_min = center_value - anchor * new_width
+        new_min = float(np.clip(new_min, 0.0, 65535.0 - new_width))
+        self.x_min, self.x_max = new_min, new_min + new_width
+        self.update()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self._plot_rect().contains(event.pos()):
+            self.drag_start = event.pos()
+            self.drag_range = (self.x_min, self.x_max)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.drag_start is None:
+            return
+        plot = self._plot_rect()
+        width = self.drag_range[1] - self.drag_range[0]
+        shift = -(event.pos().x() - self.drag_start.x()) * width / max(plot.width(), 1)
+        new_min = float(np.clip(self.drag_range[0] + shift, 0.0, 65535.0 - width))
+        self.x_min, self.x_max = new_min, new_min + width
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.drag_start = None
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        self.reset_range()
 
 
 class ImagePane(QWidget):
@@ -1388,7 +1737,7 @@ class ApplyWorker(QThread):
 
     def run(self) -> None:
         try:
-            result = apply_rnc_stretch(self.image.rgb, self.params)
+            result = apply_rnc_stretch(self.image.rgb, self.params, capture_histograms=False)
             self.finished.emit(True, result, "")
         except Exception as exc:
             self.finished.emit(False, None, str(exc))
@@ -1402,8 +1751,12 @@ class RNCColorStretchGUI(QMainWindow):
         self.loaded_image: Optional[LoadedImage] = None
         self.preview_worker: Optional[PreviewWorker] = None
         self.apply_worker: Optional[ApplyWorker] = None
+        self.apply_target_path: Optional[Path] = None
+        self.apply_target_shape: Optional[Tuple[int, ...]] = None
+        self.preview_is_current = False
         self.last_run_log = ""
         self.status_messages: list[str] = []
+        self.histogram_snapshots: Tuple[HistogramSnapshot, ...] = ()
         self.preview_timer = QTimer(self)
         self.preview_timer.setInterval(450)
         self.preview_timer.setSingleShot(True)
@@ -1423,7 +1776,7 @@ class RNCColorStretchGUI(QMainWindow):
         main_layout = QHBoxLayout(central)
 
         left_panel = QWidget()
-        left_panel.setMinimumWidth(370)
+        left_panel.setMinimumWidth(500)
         left_layout = QVBoxLayout(left_panel)
 
         source_box = QGroupBox("Source")
@@ -1439,9 +1792,16 @@ class RNCColorStretchGUI(QMainWindow):
         source_layout.addWidget(browse_button, 1, 1)
         left_layout.addWidget(source_box)
 
-        params_box = QGroupBox("Stretch Parameters")
+        params_container = QWidget()
+        params_container_layout = QVBoxLayout(params_container)
+        params_container_layout.setContentsMargins(0, 0, 0, 0)
+        params_box = QGroupBox("Clark RNC Controls")
         params_layout = QGridLayout(params_box)
         params_layout.setColumnStretch(1, 1)
+        extensions_box = QGroupBox("Siril Extensions")
+        extensions_layout = QGridLayout(extensions_box)
+        extensions_layout.setColumnStretch(1, 1)
+        ext_row = 0
         row = 0
         self.tone_curve_check = QCheckBox("Tone curve")
         self.tone_curve_check.setToolTip(PARAMETER_TOOLTIPS["tone_curve"])
@@ -1450,7 +1810,7 @@ class RNCColorStretchGUI(QMainWindow):
         row += 1
 
         self.sky_spin = ParameterSlider(0.005, 0.200, DEFAULT_SKY_LEVEL_FACTOR, decimals=3, single_step=0.001, page_step=0.010)
-        self.add_parameter_label(params_layout, row, "Sky level factor", PARAMETER_TOOLTIPS["sky"])
+        self.add_parameter_label(params_layout, row, "Histogram sky level fraction", PARAMETER_TOOLTIPS["sky"])
         self.sky_spin.setToolTip(PARAMETER_TOOLTIPS["sky"])
         params_layout.addWidget(self.sky_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.sky_spin.setValue(DEFAULT_SKY_LEVEL_FACTOR), PARAMETER_TOOLTIPS["sky"])
@@ -1460,7 +1820,7 @@ class RNCColorStretchGUI(QMainWindow):
         self.sky_region_combo.addItem("Full image", "full")
         self.sky_region_combo.addItem("Auto darkest window", "auto")
         self.sky_region_combo.addItem("Manual window", "manual")
-        self.add_parameter_label(params_layout, row, "Sky region", "Region used to compute RGB sky-zero histograms.")
+        self.add_parameter_label(params_layout, row, "Histogram area", "Area used to compute RGB histograms; equivalent to Clark's -histogrambox1.")
         params_layout.addWidget(self.sky_region_combo, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.sky_region_combo.setCurrentIndex(0), "")
         row += 1
@@ -1470,11 +1830,11 @@ class RNCColorStretchGUI(QMainWindow):
         self.sky_height_spin = self.make_int_spin(1, 200000, DEFAULT_SKY_HEIGHT)
         self.sky_step_spin = self.make_int_spin(1, 20, DEFAULT_SKY_STEP_FRACTION)
         for label_text, widget in (
-            ("Sky X", self.sky_x_spin),
-            ("Sky Y", self.sky_y_spin),
-            ("Sky width", self.sky_width_spin),
-            ("Sky height", self.sky_height_spin),
-            ("Auto step fraction", self.sky_step_spin),
+            ("Histogram X", self.sky_x_spin),
+            ("Histogram Y", self.sky_y_spin),
+            ("Histogram width", self.sky_width_spin),
+            ("Histogram height", self.sky_height_spin),
+            ("Auto-area step fraction", self.sky_step_spin),
         ):
             self.add_parameter_label(params_layout, row, label_text, "Sky-region coordinate or scan parameter.")
             params_layout.addWidget(widget, row, 1)
@@ -1484,22 +1844,22 @@ class RNCColorStretchGUI(QMainWindow):
         self.zero_g_spin = ParameterSlider(0, 20000, DEFAULT_ZERO_SKY, single_step=64, page_step=512)
         self.zero_b_spin = ParameterSlider(0, 20000, DEFAULT_ZERO_SKY, single_step=64, page_step=512)
         self.zero_rgb_spin = ParameterSlider(0, 20000, DEFAULT_ZERO_SKY, single_step=64, page_step=512)
-        self.add_parameter_label(params_layout, row, "Zero sky RGB", PARAMETER_TOOLTIPS["zero_rgb"])
+        self.add_parameter_label(params_layout, row, "RGB sky zero — all channels", PARAMETER_TOOLTIPS["zero_rgb"])
         self.zero_rgb_spin.setToolTip(PARAMETER_TOOLTIPS["zero_rgb"])
         params_layout.addWidget(self.zero_rgb_spin, row, 1)
         self.add_reset_button(params_layout, row, self.reset_zero_rgb, PARAMETER_TOOLTIPS["zero_rgb"])
         row += 1
-        self.add_parameter_label(params_layout, row, "Zero sky R", PARAMETER_TOOLTIPS["zero_r"])
+        self.add_parameter_label(params_layout, row, "Final sky zero R", PARAMETER_TOOLTIPS["zero_r"])
         self.zero_r_spin.setToolTip(PARAMETER_TOOLTIPS["zero_r"])
         params_layout.addWidget(self.zero_r_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.zero_r_spin.setValue(DEFAULT_ZERO_SKY), PARAMETER_TOOLTIPS["zero_r"])
         row += 1
-        self.add_parameter_label(params_layout, row, "Zero sky G", PARAMETER_TOOLTIPS["zero_g"])
+        self.add_parameter_label(params_layout, row, "Final sky zero G", PARAMETER_TOOLTIPS["zero_g"])
         self.zero_g_spin.setToolTip(PARAMETER_TOOLTIPS["zero_g"])
         params_layout.addWidget(self.zero_g_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.zero_g_spin.setValue(DEFAULT_ZERO_SKY), PARAMETER_TOOLTIPS["zero_g"])
         row += 1
-        self.add_parameter_label(params_layout, row, "Zero sky B", PARAMETER_TOOLTIPS["zero_b"])
+        self.add_parameter_label(params_layout, row, "Final sky zero B", PARAMETER_TOOLTIPS["zero_b"])
         self.zero_b_spin.setToolTip(PARAMETER_TOOLTIPS["zero_b"])
         params_layout.addWidget(self.zero_b_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.zero_b_spin.setValue(DEFAULT_ZERO_SKY), PARAMETER_TOOLTIPS["zero_b"])
@@ -1507,11 +1867,11 @@ class RNCColorStretchGUI(QMainWindow):
 
         self.stretch_type_combo = QComboBox()
         self.stretch_type_combo.addItem("No stretch", "none")
-        self.stretch_type_combo.addItem("Root power", "root")
-        self.stretch_type_combo.addItem("ASINH", "asinh")
-        self.stretch_type_combo.addItem("Log", "log")
+        self.stretch_type_combo.addItem("Clark root-power", "root")
+        self.stretch_type_combo.addItem("ASINH (Siril extension)", "asinh")
+        self.stretch_type_combo.addItem("Log (Siril extension)", "log")
         self.stretch_type_combo.setCurrentIndex(1)
-        self.add_parameter_label(params_layout, row, "Stretch type", "Stretch algorithm to apply after initial sky-zero.")
+        self.add_parameter_label(params_layout, row, "Stretch algorithm", "Clark's tool uses root-power; ASINH and Log are Siril-app extensions.")
         params_layout.addWidget(self.stretch_type_combo, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.stretch_type_combo.setCurrentIndex(1), "")
         row += 1
@@ -1519,17 +1879,17 @@ class RNCColorStretchGUI(QMainWindow):
         self.rootpower_spin = ParameterSlider(1, 600, DEFAULT_ROOTPOWER, single_step=1, page_step=10)
         self.rootpower2_spin = ParameterSlider(1, 600, DEFAULT_ROOTPOWER2, single_step=1, page_step=10)
         self.rootiter_spin = self.make_int_spin(1, 4, DEFAULT_ROOTITER)
-        self.add_parameter_label(params_layout, row, "Root power", PARAMETER_TOOLTIPS["rootpower"])
+        self.add_parameter_label(params_layout, row, "Power factor", PARAMETER_TOOLTIPS["rootpower"])
         self.rootpower_spin.setToolTip(PARAMETER_TOOLTIPS["rootpower"])
         params_layout.addWidget(self.rootpower_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.rootpower_spin.setValue(DEFAULT_ROOTPOWER), PARAMETER_TOOLTIPS["rootpower"])
         row += 1
-        self.add_parameter_label(params_layout, row, "Root power 2", PARAMETER_TOOLTIPS["rootpower2"])
+        self.add_parameter_label(params_layout, row, "Second-iteration power factor", PARAMETER_TOOLTIPS["rootpower2"])
         self.rootpower2_spin.setToolTip(PARAMETER_TOOLTIPS["rootpower2"])
         params_layout.addWidget(self.rootpower2_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.rootpower2_spin.setValue(DEFAULT_ROOTPOWER2), PARAMETER_TOOLTIPS["rootpower2"])
         row += 1
-        self.add_parameter_label(params_layout, row, "Root iterations", PARAMETER_TOOLTIPS["rootiter"])
+        self.add_parameter_label(params_layout, row, "Rootpower–sky iterations", PARAMETER_TOOLTIPS["rootiter"])
         self.rootiter_spin.setToolTip(PARAMETER_TOOLTIPS["rootiter"])
         params_layout.addWidget(self.rootiter_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.rootiter_spin.setValue(DEFAULT_ROOTITER), PARAMETER_TOOLTIPS["rootiter"])
@@ -1549,18 +1909,18 @@ class RNCColorStretchGUI(QMainWindow):
             ("Log K2", self.log_k2_spin, DEFAULT_LOG_K2),
             ("Log iterations", self.log_iter_spin, DEFAULT_ROOTITER),
         ):
-            self.add_parameter_label(params_layout, row, label_text, "Parameters for ASINH or logarithmic stretch modes.")
-            params_layout.addWidget(widget, row, 1)
+            self.add_parameter_label(extensions_layout, ext_row, label_text, "Siril extension for ASINH or logarithmic stretch modes.")
+            extensions_layout.addWidget(widget, ext_row, 1)
             if hasattr(widget, "setValue"):
-                self.add_reset_button(params_layout, row, lambda w=widget, v=default: w.setValue(v), "")
-            row += 1
+                self.add_reset_button(extensions_layout, ext_row, lambda w=widget, v=default: w.setValue(v), "")
+            ext_row += 1
 
         self.scurve_combo = QComboBox()
         self.scurve_combo.addItem("None", 0)
         self.scurve_combo.addItem("S-curve 1", 1)
-        self.scurve_combo.addItem("S-curve 2", 2)
-        self.scurve_combo.addItem("S-curve 1 then 2", 3)
-        self.scurve_combo.addItem("S-curve 2 then 1", 4)
+        self.scurve_combo.addItem("S-curve 1 → 2", 2)
+        self.scurve_combo.addItem("S-curve 1 → 2 → 1", 3)
+        self.scurve_combo.addItem("S-curve 1 → 2 → 1 → 2", 4)
         self.add_parameter_label(params_layout, row, "S-curve", PARAMETER_TOOLTIPS["s_curve"])
         self.scurve_combo.setToolTip(PARAMETER_TOOLTIPS["s_curve"])
         params_layout.addWidget(self.scurve_combo, row, 1)
@@ -1569,23 +1929,28 @@ class RNCColorStretchGUI(QMainWindow):
 
         self.color_mode_combo = QComboBox()
         self.color_mode_combo.addItem("None", "none")
-        self.color_mode_combo.addItem("Ratio", "ratio")
-        self.color_mode_combo.addItem("HSV", "hsv")
+        self.color_mode_combo.addItem("Clark ratio recovery", "ratio")
+        self.color_mode_combo.addItem("HSV recovery (Siril extension)", "hsv")
         self.color_mode_combo.setCurrentIndex(1)
-        self.add_parameter_label(params_layout, row, "Color correction", PARAMETER_TOOLTIPS["color_correction"])
+        self.add_parameter_label(params_layout, row, "Color recovery method", PARAMETER_TOOLTIPS["color_correction"])
         params_layout.addWidget(self.color_mode_combo, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.color_mode_combo.setCurrentIndex(1), PARAMETER_TOOLTIPS["color_correction"])
         row += 1
 
         self.color_enhance_spin = ParameterSlider(0.0, 3.0, DEFAULT_COLOR_ENHANCE, decimals=2, single_step=0.05, page_step=0.25)
-        self.add_parameter_label(params_layout, row, "Color enhance", PARAMETER_TOOLTIPS["color_enhance"])
+        self.add_parameter_label(params_layout, row, "Color enhancement factor", PARAMETER_TOOLTIPS["color_enhance"])
         self.color_enhance_spin.setToolTip(PARAMETER_TOOLTIPS["color_enhance"])
         params_layout.addWidget(self.color_enhance_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.color_enhance_spin.setValue(DEFAULT_COLOR_ENHANCE), PARAMETER_TOOLTIPS["color_enhance"])
         row += 1
 
+        clark_layout = params_layout
+        clark_row = row
+        params_layout = extensions_layout
+        row = ext_row
+
         self.color_gamma_spin = ParameterSlider(0.1, 10.0, DEFAULT_COLOR_GAMMA, decimals=1, single_step=0.1, page_step=1.0)
-        self.add_parameter_label(params_layout, row, "HSV gamma", "Gamma used by HSV color correction.")
+        self.add_parameter_label(params_layout, row, "HSV recovery gamma", "Siril extension: gamma used by HSV color recovery.")
         params_layout.addWidget(self.color_gamma_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.color_gamma_spin.setValue(DEFAULT_COLOR_GAMMA), "")
         row += 1
@@ -1673,7 +2038,11 @@ class RNCColorStretchGUI(QMainWindow):
         self.add_reset_button(params_layout, row, lambda: self.star_strength_spin.setValue(DEFAULT_STAR_REDUCTION_STRENGTH), "")
         row += 1
 
-        self.setmin_check = QCheckBox("Set minimum")
+        ext_row = row
+        params_layout = clark_layout
+        row = clark_row
+
+        self.setmin_check = QCheckBox("Set minimum output levels")
         self.setmin_check.setChecked(DEFAULT_SETMIN)
         self.setmin_check.setToolTip(PARAMETER_TOOLTIPS["setmin"])
         params_layout.addWidget(self.setmin_check, row, 0, 1, 2)
@@ -1682,17 +2051,17 @@ class RNCColorStretchGUI(QMainWindow):
         self.min_r_spin = ParameterSlider(0, 20000, DEFAULT_SETMIN_VALUE, single_step=64, page_step=512)
         self.min_g_spin = ParameterSlider(0, 20000, DEFAULT_SETMIN_VALUE, single_step=64, page_step=512)
         self.min_b_spin = ParameterSlider(0, 20000, DEFAULT_SETMIN_VALUE, single_step=64, page_step=512)
-        self.add_parameter_label(params_layout, row, "Minimum R", PARAMETER_TOOLTIPS["min_r"])
+        self.add_parameter_label(params_layout, row, "Minimum output R", PARAMETER_TOOLTIPS["min_r"])
         self.min_r_spin.setToolTip(PARAMETER_TOOLTIPS["min_r"])
         params_layout.addWidget(self.min_r_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.min_r_spin.setValue(DEFAULT_SETMIN_VALUE), PARAMETER_TOOLTIPS["min_r"])
         row += 1
-        self.add_parameter_label(params_layout, row, "Minimum G", PARAMETER_TOOLTIPS["min_g"])
+        self.add_parameter_label(params_layout, row, "Minimum output G", PARAMETER_TOOLTIPS["min_g"])
         self.min_g_spin.setToolTip(PARAMETER_TOOLTIPS["min_g"])
         params_layout.addWidget(self.min_g_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.min_g_spin.setValue(DEFAULT_SETMIN_VALUE), PARAMETER_TOOLTIPS["min_g"])
         row += 1
-        self.add_parameter_label(params_layout, row, "Minimum B", PARAMETER_TOOLTIPS["min_b"])
+        self.add_parameter_label(params_layout, row, "Minimum output B", PARAMETER_TOOLTIPS["min_b"])
         self.min_b_spin.setToolTip(PARAMETER_TOOLTIPS["min_b"])
         params_layout.addWidget(self.min_b_spin, row, 1)
         self.add_reset_button(params_layout, row, lambda: self.min_b_spin.setValue(DEFAULT_SETMIN_VALUE), PARAMETER_TOOLTIPS["min_b"])
@@ -1700,7 +2069,10 @@ class RNCColorStretchGUI(QMainWindow):
 
         params_scroll = QScrollArea()
         params_scroll.setWidgetResizable(True)
-        params_scroll.setWidget(params_box)
+        params_container_layout.addWidget(params_box)
+        params_container_layout.addWidget(extensions_box)
+        params_container_layout.addStretch(1)
+        params_scroll.setWidget(params_container)
         left_layout.addWidget(params_scroll, 3)
 
         output_box = QGroupBox("Apply")
@@ -1745,6 +2117,34 @@ class RNCColorStretchGUI(QMainWindow):
         splitter.setSizes([1, 1])
         preview_layout.addWidget(splitter, 1)
         tabs.addTab(preview_area, "Preview")
+
+        histogram_area = QWidget()
+        histogram_layout = QVBoxLayout(histogram_area)
+        histogram_controls = QHBoxLayout()
+        histogram_controls.addWidget(QLabel("Processing stage:"))
+        self.histogram_stage_combo = QComboBox()
+        self.histogram_stage_combo.currentIndexChanged.connect(self.update_histogram_stage)
+        histogram_controls.addWidget(self.histogram_stage_combo, 1)
+        self.histogram_curve_combo = QComboBox()
+        self.histogram_curve_combo.addItem("Smoothed (Clark sky analysis)", True)
+        self.histogram_curve_combo.addItem("Raw counts", False)
+        self.histogram_curve_combo.currentIndexChanged.connect(self.update_histogram_options)
+        histogram_controls.addWidget(self.histogram_curve_combo)
+        self.histogram_log_check = QCheckBox("Log pixel-count axis")
+        self.histogram_log_check.stateChanged.connect(self.update_histogram_options)
+        histogram_controls.addWidget(self.histogram_log_check)
+        histogram_reset_button = QPushButton("Reset Range")
+        histogram_reset_button.clicked.connect(self.reset_histogram_range)
+        histogram_controls.addWidget(histogram_reset_button)
+        histogram_layout.addLayout(histogram_controls)
+        self.histogram_plot = HistogramPlot()
+        histogram_layout.addWidget(self.histogram_plot, 1)
+        self.histogram_info_label = QLabel(
+            "Preview histogram: counts come from the downsampled image used for interactive processing."
+        )
+        self.histogram_info_label.setWordWrap(True)
+        histogram_layout.addWidget(self.histogram_info_label)
+        tabs.addTab(histogram_area, "Histogram")
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -1810,6 +2210,18 @@ class RNCColorStretchGUI(QMainWindow):
             else:
                 widget.valueChanged.connect(self.schedule_preview)
         self.zero_rgb_spin.valueChanged.connect(self.apply_zero_rgb_master)
+        for combo in (self.stretch_type_combo, self.color_mode_combo, self.white_balance_combo):
+            combo.currentIndexChanged.connect(self.update_control_enablement)
+        for checkbox in (
+            self.hsv_adjust_check,
+            self.vignette_check,
+            self.gradient_check,
+            self.rl_check,
+            self.star_reduction_check,
+            self.setmin_check,
+        ):
+            checkbox.stateChanged.connect(self.update_control_enablement)
+        self.update_control_enablement()
 
     def make_int_spin(self, minimum: int, maximum: int, value: int) -> QSpinBox:
         spin = QSpinBox()
@@ -1835,6 +2247,45 @@ class RNCColorStretchGUI(QMainWindow):
         self.before_pane.reset_view()
         self.after_pane.reset_view()
 
+    def set_histogram_snapshots(self, snapshots: Sequence[HistogramSnapshot]) -> None:
+        previous_key = self.histogram_stage_combo.currentData()
+        self.histogram_snapshots = tuple(snapshots)
+        self.histogram_stage_combo.blockSignals(True)
+        self.histogram_stage_combo.clear()
+        selected_index = -1
+        for index, snapshot in enumerate(self.histogram_snapshots):
+            self.histogram_stage_combo.addItem(snapshot.label, snapshot.key)
+            if snapshot.key == previous_key:
+                selected_index = index
+        if selected_index < 0 and self.histogram_snapshots:
+            selected_index = len(self.histogram_snapshots) - 1
+        self.histogram_stage_combo.setCurrentIndex(selected_index)
+        self.histogram_stage_combo.blockSignals(False)
+        self.update_histogram_stage()
+
+    def update_histogram_stage(self) -> None:
+        index = self.histogram_stage_combo.currentIndex()
+        snapshot = self.histogram_snapshots[index] if 0 <= index < len(self.histogram_snapshots) else None
+        self.histogram_plot.set_snapshot(snapshot)
+        if snapshot is None:
+            self.histogram_info_label.setText("No preview histogram is available.")
+            return
+        x1, y1, x2, y2 = snapshot.region
+        sky_note = (
+            f"; detected sky RGB {snapshot.sky_levels}" if snapshot.sky_levels is not None else ""
+        )
+        self.histogram_info_label.setText(
+            f"Preview histogram (downsampled): region x={x1}:{x2}, y={y1}:{y2}; "
+            f"peaks RGB {snapshot.peaks}; target sky zero RGB {snapshot.target_zero}{sky_note}."
+        )
+
+    def update_histogram_options(self) -> None:
+        self.histogram_plot.set_smoothed(bool(self.histogram_curve_combo.currentData()))
+        self.histogram_plot.set_log_counts(self.histogram_log_check.isChecked())
+
+    def reset_histogram_range(self) -> None:
+        self.histogram_plot.reset_range()
+
     def apply_zero_rgb_master(self) -> None:
         value = int(self.zero_rgb_spin.value())
         for slider in (self.zero_r_spin, self.zero_g_spin, self.zero_b_spin):
@@ -1845,6 +2296,28 @@ class RNCColorStretchGUI(QMainWindow):
 
     def reset_zero_rgb(self) -> None:
         self.zero_rgb_spin.setValue(DEFAULT_ZERO_SKY)
+
+    def update_control_enablement(self) -> None:
+        stretch_type = self.stretch_type_combo.currentData()
+        for widget in (self.rootpower_spin, self.rootpower2_spin, self.rootiter_spin):
+            widget.setEnabled(stretch_type == "root")
+        for widget in (self.asinh_k1_spin, self.asinh_k2_spin, self.asinh_iter_spin):
+            widget.setEnabled(stretch_type == "asinh")
+        for widget in (self.log_k1_spin, self.log_k2_spin, self.log_iter_spin):
+            widget.setEnabled(stretch_type == "log")
+        self.color_gamma_spin.setEnabled(self.color_mode_combo.currentData() == "hsv")
+        for widget in (self.hue_adjust_spin, self.sat_adjust_spin, self.val_adjust_spin, self.vib_adjust_spin):
+            widget.setEnabled(self.hsv_adjust_check.isChecked())
+        temp_tint = self.white_balance_combo.currentData() == "temp_tint"
+        self.temp_spin.setEnabled(temp_tint)
+        self.tint_spin.setEnabled(temp_tint)
+        self.vignette_strength_spin.setEnabled(self.vignette_check.isChecked())
+        self.gradient_strength_spin.setEnabled(self.gradient_check.isChecked())
+        self.rl_iterations_spin.setEnabled(self.rl_check.isChecked())
+        self.rl_sigma_spin.setEnabled(self.rl_check.isChecked())
+        self.star_strength_spin.setEnabled(self.star_reduction_check.isChecked())
+        for widget in (self.min_r_spin, self.min_g_spin, self.min_b_spin):
+            widget.setEnabled(self.setmin_check.isChecked())
 
     def current_params(self) -> StretchParameters:
         return StretchParameters(
@@ -1942,8 +2415,9 @@ class RNCColorStretchGUI(QMainWindow):
         self.set_loaded_image(image)
         self.log(f"Loaded {path}")
 
-    def set_loaded_image(self, image: LoadedImage) -> None:
+    def set_loaded_image(self, image: LoadedImage, *, schedule_preview: bool = True) -> None:
         self.loaded_image = image
+        self.preview_is_current = False
         height, width = image.rgb.shape[:2]
         origin = "current Siril image" if image.source_is_current else "file"
         color_note = "color" if image.is_color else "grayscale expanded to RGB"
@@ -1952,13 +2426,16 @@ class RNCColorStretchGUI(QMainWindow):
         )
         self.before_pane.set_image(rgb_to_display(image.preview_input, image.display_limits))
         self.after_pane.clear()
+        self.set_histogram_snapshots(())
         self.update_output_label()
         self.log(f"Preview display is linear, range {image.display_limits[0]:.0f} to {image.display_limits[1]:.0f}")
         self.save_settings()
-        self.schedule_preview()
+        if schedule_preview:
+            self.schedule_preview()
 
     def schedule_preview(self) -> None:
         if self.loaded_image is not None:
+            self.preview_is_current = False
             self.preview_timer.start()
 
     def update_preview(self) -> None:
@@ -1981,7 +2458,9 @@ class RNCColorStretchGUI(QMainWindow):
         assert isinstance(stretch, StretchResult)
         limits = self.loaded_image.display_limits if self.loaded_image is not None else (0.0, 65535.0)
         self.after_pane.set_image(rgb_to_display(stretch.rgb, limits), preserve_view=True)
+        self.set_histogram_snapshots(stretch.histograms)
         self.set_run_log(stretch.log)
+        self.preview_is_current = True
         self.save_settings()
 
     def default_output_path(self) -> Path:
@@ -1989,22 +2468,59 @@ class RNCColorStretchGUI(QMainWindow):
         return self.loaded_image.path.with_name(f"{self.loaded_image.path.stem}_rnc_stretched.fit")
 
     def update_output_label(self) -> None:
-        if self.loaded_image is None:
-            return
-        if self.loaded_image.source_is_current and self.siril is not None:
-            self.output_label.setText("Apply updates the active Siril image in memory. Use Siril Save or Save As afterward.")
-        else:
+        if self.siril is not None:
+            try:
+                filename = self.siril.get_image_filename()
+            except Exception:
+                filename = None
+            target = Path(str(filename)).name if filename else "the active Siril image"
+            self.output_label.setText(
+                f"Apply target: {target}. The active Siril image will be updated in memory; use Siril Save or Save As afterward."
+            )
+        elif self.loaded_image is not None:
             self.output_label.setText(f"Local mode output file: {self.default_output_path()}")
 
+    def active_image_matches_preview(self, active: LoadedImage) -> bool:
+        return images_match_for_apply(self.loaded_image, active)
+
+    def refresh_active_apply_target(self) -> bool:
+        """Load Siril's active image and return whether it matches the preview target."""
+        assert self.siril is not None
+        fit = self.siril.get_image(with_pixels=True, preview=False)
+        filename = self.siril.get_image_filename() if hasattr(self.siril, "get_image_filename") else None
+        active = loaded_image_from_siril_fit(fit, filename)
+        matches = self.active_image_matches_preview(active)
+        if matches:
+            self.loaded_image = active
+            self.update_output_label()
+        else:
+            self.set_loaded_image(active, schedule_preview=True)
+        return matches
+
     def apply_to_full_image(self) -> None:
-        if self.siril is not None and (self.loaded_image is None or self.loaded_image.source_is_current):
+        if self.siril is not None:
             try:
-                fit = self.siril.get_image(with_pixels=True, preview=False)
-                filename = self.siril.get_image_filename() if hasattr(self.siril, "get_image_filename") else None
-                self.loaded_image = loaded_image_from_siril_fit(fit, filename)
+                matches_preview = self.refresh_active_apply_target()
             except Exception as exc:
                 QMessageBox.warning(self, "Load Failed", f"Could not read the active Siril image:\n{exc}")
                 self.log(f"Loading active Siril image failed: {exc}")
+                return
+            if not matches_preview:
+                QMessageBox.information(
+                    self,
+                    "Preview Refreshed",
+                    "The active Siril image differed from the preview source. Its preview has been refreshed; review it and press Apply again.",
+                )
+                self.log("Apply paused because the active Siril image differed from the preview source.")
+                return
+            if not self.preview_is_current:
+                self.schedule_preview()
+                QMessageBox.information(
+                    self,
+                    "Preview Required",
+                    "The parameters or source changed after the last preview. Review the refreshed preview, then press Apply again.",
+                )
+                self.log("Apply paused because the current parameters had not been previewed.")
                 return
         if self.loaded_image is None:
             QMessageBox.warning(self, "Missing Image", "Use the current Siril image or choose an image first.")
@@ -2012,6 +2528,8 @@ class RNCColorStretchGUI(QMainWindow):
         if self.apply_worker is not None and self.apply_worker.isRunning():
             return
         self.update_output_label()
+        self.apply_target_path = self.loaded_image.path
+        self.apply_target_shape = tuple(self.loaded_image.original_shape)
         self.set_busy(True, "Applying...")
         self.apply_worker = ApplyWorker(self.loaded_image, self.current_params())
         self.apply_worker.finished.connect(self.on_apply_finished)
@@ -2027,20 +2545,27 @@ class RNCColorStretchGUI(QMainWindow):
         assert isinstance(stretch, StretchResult)
         if self.loaded_image is not None and self.loaded_image.source_is_current and self.siril is not None:
             try:
-                siril_data = result_rgb_to_siril_data(stretch.rgb, self.loaded_image)
-                with self.siril.image_lock():
-                    if hasattr(self.siril, "undo_save_state"):
-                        self.siril.undo_save_state("RNC color stretch")
-                    self.siril.set_image_pixeldata(siril_data)
-                self.loaded_image.rgb = stretch.rgb.astype(np.float32, copy=False)
-                self.loaded_image.preview_input = self.loaded_image.rgb[
-                    :: self.loaded_image.preview_scale, :: self.loaded_image.preview_scale, :
-                ].astype(np.float32, copy=True)
-                self.before_pane.set_image(rgb_to_display(self.loaded_image.preview_input, self.loaded_image.display_limits))
-                self.after_pane.clear()
+                current_filename = self.siril.get_image_filename() if hasattr(self.siril, "get_image_filename") else None
+                current_path = Path(str(current_filename)) if current_filename else Path("current_siril_image.fit")
+                current_meta = self.siril.get_image(with_pixels=False, preview=False)
+                current_shape = (
+                    (int(current_meta.height), int(current_meta.width))
+                    if int(current_meta.channels) == 1
+                    else (int(current_meta.channels), int(current_meta.height), int(current_meta.width))
+                )
+                if self.apply_target_path is not None and current_path.name != self.apply_target_path.name:
+                    raise RuntimeError("The active Siril image changed while the stretch was running; nothing was applied")
+                if self.apply_target_shape is not None and tuple(current_shape) != tuple(self.apply_target_shape):
+                    raise RuntimeError("The active Siril image dimensions changed while the stretch was running; nothing was applied")
+                readback_fit = write_result_to_siril(self.siril, self.loaded_image, stretch.rgb)
+                readback_filename = self.siril.get_image_filename() if hasattr(self.siril, "get_image_filename") else None
+                applied_image = loaded_image_from_siril_fit(readback_fit, readback_filename)
+                preview_histograms = self.histogram_snapshots
+                self.set_loaded_image(applied_image, schedule_preview=False)
+                self.set_histogram_snapshots(preview_histograms)
                 self.set_run_log(f"Applied to active Siril image.\n\n{stretch.log}")
                 self.log("Applied stretch to active Siril image. Save or Save As from Siril to keep it.")
-                self.tabs.setCurrentIndex(1)
+                self.tabs.setCurrentWidget(self.log_text)
                 QMessageBox.information(
                     self,
                     "RNC Stretch Applied",
@@ -2063,7 +2588,7 @@ class RNCColorStretchGUI(QMainWindow):
             return
         self.set_run_log(f"Output file: {output_path}\n\n{stretch.log}")
         self.log(f"Wrote {output_path}")
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentWidget(self.log_text)
         QMessageBox.information(self, "RNC Stretch Complete", f"Wrote:\n{output_path}")
 
     def set_busy(self, busy: bool, text: str) -> None:

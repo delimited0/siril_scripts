@@ -15,7 +15,7 @@ Requirements:
 - PyQt5
 - numpy
 - astropy
-- pillow
+- tifffile
 - scipy
 """
 
@@ -40,7 +40,7 @@ if SIRILPY_AVAILABLE:
             "PyQt5",
             "numpy",
             "astropy",
-            "pillow",
+            "tifffile",
             "scipy",
             version_constraints=[None, ">=1.20.0", ">=4.0", None, None],
         )
@@ -48,7 +48,7 @@ if SIRILPY_AVAILABLE:
         raise RuntimeError(f"Error ensuring dependencies: {exc}") from exc
 
 from astropy.io import fits
-from PIL import Image
+import tifffile
 from PyQt5.QtCore import QPoint, QRect, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
@@ -200,7 +200,16 @@ ORIENTATION_OPTIONS = [
     ("Rotated 90° CW", 1),
     ("Rotated 180°", 2),
     ("Rotated 270° CW", 3),
+    ("Mirrored left-to-right", 4),
+    ("Transposed", 5),
+    ("Mirrored top-to-bottom", 6),
+    ("Transposed and rotated 180°", 7),
 ]
+
+DEFAULT_REFERENCE_NAME = "After Nov 2014"
+DEFAULT_WB_PATCH_LABEL = "Neutral 5"
+DEFAULT_NORMALIZATION_PATCH_INDEX = WB_PATCH_INDEX[DEFAULT_WB_PATCH_LABEL]
+CLIPPED_PIXEL_THRESHOLD = 0.01
 
 EDGE_LEFT = 1
 EDGE_RIGHT = 2
@@ -215,6 +224,14 @@ class LoadedImage:
     preview_rgb: np.ndarray
     preview_scale: int
     is_color: bool
+    clipping_value: Optional[float]
+
+
+@dataclass
+class PatchSamplingResult:
+    rgb: np.ndarray
+    clipped_fractions: np.ndarray
+    included_mask: np.ndarray
 
 
 @dataclass
@@ -224,7 +241,8 @@ class CalibrationResult:
     combined_matrix: np.ndarray
     siril_matrix_after_wb: np.ndarray
     siril_matrix_one_step: np.ndarray
-    siril_output_scale: float
+    patch_delta_e: np.ndarray
+    included_mask: np.ndarray
     mean_delta_e: float
     max_delta_e: float
     optimization_note: Optional[str]
@@ -322,12 +340,11 @@ def read_fits_rgb(path: Path) -> Tuple[np.ndarray, bool]:
     raise ValueError(f"No image data found in {path}")
 
 
-def read_tiff_rgb(path: Path) -> Tuple[np.ndarray, bool]:
-    """Read TIFF data and return HWC RGB plus whether the source is genuinely color."""
-    with Image.open(path) as image:
-        image.load()
-        array = np.asarray(image)
-
+def _tiff_array_to_rgb(array: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """Convert a TIFF array to floating-point HWC RGB without reducing bit depth."""
+    array = np.asarray(array)
+    if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+        array = np.moveaxis(array, 0, -1)
     if array.ndim == 2:
         rgb = np.repeat(array[:, :, np.newaxis], 3, axis=2)
         return np.asarray(rgb, dtype=np.float32), False
@@ -345,13 +362,28 @@ def read_tiff_rgb(path: Path) -> Tuple[np.ndarray, bool]:
     return np.asarray(array[:, :, :3], dtype=np.float32), True
 
 
+def read_tiff_rgb(path: Path) -> Tuple[np.ndarray, bool]:
+    """Read a TIFF with tifffile, preserving the source's full sample precision."""
+    return _tiff_array_to_rgb(tifffile.imread(path))
+
+
+def integer_clipping_value(dtype: np.dtype) -> Optional[float]:
+    """Return the representable maximum for an integer source dtype."""
+    dtype = np.dtype(dtype)
+    return float(np.iinfo(dtype).max) if np.issubdtype(dtype, np.integer) else None
+
+
 def read_image_file(path: Path) -> LoadedImage:
     """Load a FITS or TIFF image and build a downsampled display preview."""
     suffix = path.suffix.lower()
     if suffix in SUPPORTED_FITS_SUFFIXES:
         rgb, is_color = read_fits_rgb(path)
+        maximum = float(np.nanmax(rgb))
+        clipping_value = 65535.0 if maximum >= 65535.0 else (1.0 if 0.9 <= maximum <= 2.0 else None)
     elif suffix in SUPPORTED_TIFF_SUFFIXES:
-        rgb, is_color = read_tiff_rgb(path)
+        tiff_array = tifffile.imread(path)
+        clipping_value = integer_clipping_value(tiff_array.dtype)
+        rgb, is_color = _tiff_array_to_rgb(tiff_array)
     else:
         raise ValueError(f"Unsupported file type: {path.suffix}")
 
@@ -363,6 +395,7 @@ def read_image_file(path: Path) -> LoadedImage:
         preview_rgb=preview_rgb,
         preview_scale=preview_scale,
         is_color=is_color,
+        clipping_value=clipping_value,
     )
 
 
@@ -438,16 +471,23 @@ def crop_array(data: np.ndarray, rect: Tuple[int, int, int, int]) -> np.ndarray:
 
 
 def rotate_crop_to_upright(crop_rgb: np.ndarray, orientation_value: int) -> np.ndarray:
-    """Rotate the selected chart crop into the canonical 6x4 upright layout."""
-    if orientation_value == 0:
-        return crop_rgb
-    if orientation_value == 1:
-        return np.rot90(crop_rgb, k=1).copy()
-    if orientation_value == 2:
-        return np.rot90(crop_rgb, k=2).copy()
-    if orientation_value == 3:
-        return np.rot90(crop_rgb, k=3).copy()
-    raise ValueError(f"Unsupported orientation value: {orientation_value}")
+    """Transform any of the eight chart orientations to canonical 6x4 order."""
+    if not 0 <= orientation_value < 8:
+        raise ValueError(f"Unsupported orientation value: {orientation_value}")
+    result = crop_rgb
+    if orientation_value >= 4:
+        result = np.fliplr(result)
+    return np.rot90(result, k=orientation_value % 4).copy()
+
+
+def orient_upright_chart(upright: np.ndarray, orientation_value: int) -> np.ndarray:
+    """Apply a display orientation; inverse of rotate_crop_to_upright."""
+    if not 0 <= orientation_value < 8:
+        raise ValueError(f"Unsupported orientation value: {orientation_value}")
+    result = np.rot90(upright, k=-(orientation_value % 4))
+    if orientation_value >= 4:
+        result = np.fliplr(result)
+    return result.copy()
 
 
 def clamp_patch_sample_fraction(sample_fraction: float) -> float:
@@ -462,15 +502,10 @@ def patch_inset_fraction(sample_fraction: float) -> float:
 
 def rotate_grid_position(col: int, row: int, cols: int, rows: int, orientation_value: int) -> Tuple[int, int]:
     """Rotate a grid cell position into the displayed orientation."""
-    if orientation_value == 0:
-        return col, row
-    if orientation_value == 1:
-        return rows - 1 - row, col
-    if orientation_value == 2:
-        return cols - 1 - col, rows - 1 - row
-    if orientation_value == 3:
-        return row, cols - 1 - col
-    raise ValueError(f"Unsupported orientation value: {orientation_value}")
+    grid = np.arange(rows * cols).reshape(rows, cols)
+    displayed = orient_upright_chart(grid, orientation_value)
+    displayed_row, displayed_col = np.argwhere(displayed == grid[row, col])[0]
+    return int(displayed_col), int(displayed_row)
 
 
 def sample_patch_median(patch_rgb: np.ndarray) -> np.ndarray:
@@ -489,7 +524,9 @@ def sample_colorchecker_patches(
     crop_rgb: np.ndarray,
     orientation_value: int,
     patch_sample_fraction: float,
-) -> np.ndarray:
+    clipping_value: Optional[float] = None,
+    return_details: bool = False,
+) -> np.ndarray | PatchSamplingResult:
     """Split the chart crop into a 6x4 patch grid and sample each patch."""
     upright = rotate_crop_to_upright(crop_rgb, orientation_value)
     height, width = upright.shape[:2]
@@ -499,6 +536,7 @@ def sample_colorchecker_patches(
     row_edges = np.linspace(0, height, 5)
     col_edges = np.linspace(0, width, 7)
     patch_samples: List[np.ndarray] = []
+    clipped_fractions: List[float] = []
     inset_fraction = patch_inset_fraction(patch_sample_fraction)
 
     for row in range(4):
@@ -522,8 +560,20 @@ def sample_colorchecker_patches(
             if patch.shape[0] < 2 or patch.shape[1] < 2:
                 raise ValueError("Crop selection is too tight for reliable patch sampling")
             patch_samples.append(sample_patch_median(patch))
+            if clipping_value is None:
+                clipped_fractions.append(0.0)
+            else:
+                clipped = np.any(patch[:, :, :3] >= clipping_value, axis=2)
+                clipped_fractions.append(float(np.mean(clipped)))
 
-    return np.stack(patch_samples, axis=0)
+    rgb = np.stack(patch_samples, axis=0)
+    fractions = np.asarray(clipped_fractions, dtype=np.float64)
+    details = PatchSamplingResult(
+        rgb=rgb,
+        clipped_fractions=fractions,
+        included_mask=fractions <= CLIPPED_PIXEL_THRESHOLD,
+    )
+    return details if return_details else details.rgb
 
 
 def white_balance_from_patch(rgb: np.ndarray, reference_channel: str = "G") -> np.ndarray:
@@ -692,24 +742,53 @@ def solve_forward_matrix(
     sampled_rgb: np.ndarray,
     reference_lab: np.ndarray,
     wb_vector: np.ndarray,
-    siril_output_scale: float,
+    included_mask: Optional[np.ndarray] = None,
+    normalization_patch_index: int = DEFAULT_NORMALIZATION_PATCH_INDEX,
 ) -> CalibrationResult:
-    """Fit a forward matrix using least squares seeded from the normal equation."""
+    """Fit a Neutral-5-normalized, luminance-normalized forward matrix."""
     rgb_wb = np.asarray(sampled_rgb, dtype=np.float64) * np.asarray(wb_vector, dtype=np.float64)[np.newaxis, :]
     if np.any(~np.isfinite(rgb_wb)) or np.any(rgb_wb <= 0):
         raise ValueError("Sampled RGB values must be finite and positive after white balance")
-    if not np.isfinite(siril_output_scale) or siril_output_scale <= 0:
-        raise ValueError("Siril output scale must be a finite positive value")
+
+    reference_lab = np.asarray(reference_lab, dtype=np.float64)
+    if rgb_wb.shape != reference_lab.shape or rgb_wb.shape[1] != 3:
+        raise ValueError("Sampled RGB and reference Lab must be matching Nx3 arrays")
+    if not 0 <= normalization_patch_index < rgb_wb.shape[0]:
+        raise ValueError("Normalization patch index is outside the sample array")
+
+    mask = np.ones(rgb_wb.shape[0], dtype=bool) if included_mask is None else np.asarray(included_mask, dtype=bool)
+    if mask.shape != (rgb_wb.shape[0],):
+        raise ValueError("Included-patch mask must contain one value per patch")
+    if np.count_nonzero(mask) < 9:
+        raise ValueError("At least nine unclipped ColorChecker patches are required")
+    if not mask[normalization_patch_index]:
+        raise ValueError(f"The normalization patch {PATCH_NAMES[normalization_patch_index]} is clipped")
+
+    # With the default Neutral-5 WB, its three values are identical. Use their
+    # scalar mean so normalization removes exposure without introducing another
+    # hidden per-channel balance when a different WB patch is selected.
+    camera_normalizer = float(np.mean(rgb_wb[normalization_patch_index]))
+    normalized_rgb = rgb_wb / camera_normalizer
 
     reference_xyz = lab_to_xyz(reference_lab)
-    seed = seed_forward_matrix(rgb_wb, reference_xyz)
+    reference_luminance = float(reference_xyz[normalization_patch_index, 1])
+    normalized_reference_xyz = reference_xyz / reference_luminance
+    seed = seed_forward_matrix(normalized_rgb[mask], normalized_reference_xyz[mask])
+
+    def normalize_luminance(matrix: np.ndarray) -> np.ndarray:
+        luminance_sum = float(np.sum(matrix[1]))
+        if not np.isfinite(luminance_sum) or abs(luminance_sum) <= EPSILON:
+            return matrix
+        return matrix / luminance_sum
+
+    seed = normalize_luminance(seed)
 
     def objective(parameters: np.ndarray) -> float:
-        matrix = parameters.reshape(3, 3)
-        xyz = rgb_wb @ matrix.T
-        xyz = np.clip(xyz, EPSILON, None)
+        matrix = normalize_luminance(parameters.reshape(3, 3))
+        xyz = normalized_rgb[mask] @ matrix.T
+        xyz = np.clip(xyz * reference_luminance, EPSILON, None)
         lab = xyz_to_lab(xyz)
-        delta_e = ciede2000(lab, reference_lab)
+        delta_e = ciede2000(lab, reference_lab[mask])
         if not np.all(np.isfinite(delta_e)):
             return 1e12
         return float(np.mean(delta_e))
@@ -723,18 +802,18 @@ def solve_forward_matrix(
     )
 
     if result.success and np.all(np.isfinite(result.x)):
-        forward_matrix = result.x.reshape(3, 3)
+        forward_matrix = normalize_luminance(result.x.reshape(3, 3))
     else:
         forward_matrix = seed
         message = getattr(result, "message", "unknown optimization failure")
         optimization_note = f"Used the normal-equation seed because the dE00 refinement did not converge: {message}"
 
-    xyz_fit = np.clip(rgb_wb @ forward_matrix.T, EPSILON, None)
+    xyz_fit = np.clip(normalized_rgb @ forward_matrix.T * reference_luminance, EPSILON, None)
     lab_fit = xyz_to_lab(xyz_fit)
     delta_e = ciede2000(lab_fit, reference_lab)
     combined_matrix = forward_matrix @ np.diag(wb_vector)
     xyz_to_srgb_matrix = xyz_d50_to_linear_srgb_matrix()
-    siril_matrix_after_wb = siril_output_scale * (xyz_to_srgb_matrix @ forward_matrix)
+    siril_matrix_after_wb = xyz_to_srgb_matrix @ forward_matrix
     siril_matrix_one_step = siril_matrix_after_wb @ np.diag(wb_vector)
 
     return CalibrationResult(
@@ -743,9 +822,10 @@ def solve_forward_matrix(
         combined_matrix=combined_matrix,
         siril_matrix_after_wb=siril_matrix_after_wb,
         siril_matrix_one_step=siril_matrix_one_step,
-        siril_output_scale=float(siril_output_scale),
-        mean_delta_e=float(np.mean(delta_e)),
-        max_delta_e=float(np.max(delta_e)),
+        patch_delta_e=delta_e,
+        included_mask=mask,
+        mean_delta_e=float(np.mean(delta_e[mask])),
+        max_delta_e=float(np.max(delta_e[mask])),
         optimization_note=optimization_note,
     )
 
@@ -782,6 +862,12 @@ def format_matrix_markdown(
     return "\n".join(rows)
 
 
+def format_siril_ccm(matrix: np.ndarray) -> str:
+    """Format a 3x3 matrix as a one-line Siril ccm command."""
+    coefficients = " ".join(f"{value:.8f}" for value in np.asarray(matrix).reshape(-1))
+    return f"ccm {coefficients}"
+
+
 def format_output_markdown(
     reference_name: str,
     wb_patch_label: str,
@@ -789,13 +875,45 @@ def format_output_markdown(
     result: CalibrationResult,
 ) -> str:
     """Build the final copy-pastable markdown report."""
+    excluded = [PATCH_NAMES[index] for index in np.flatnonzero(~result.included_mask)]
+    included_delta_e = result.patch_delta_e[result.included_mask]
+    outlier_limit = max(5.0, float(np.mean(included_delta_e) + 2.0 * np.std(included_delta_e)))
+    patch_rows = [
+        "### Per-patch dE00",
+        "",
+        "| Patch | dE00 | Status |",
+        "| --- | ---: | --- |",
+    ]
+    for index, (name, delta_e) in enumerate(zip(PATCH_NAMES, result.patch_delta_e)):
+        if not result.included_mask[index]:
+            status = "excluded: >1% clipped pixels"
+        elif delta_e > outlier_limit:
+            status = "outlier"
+        else:
+            status = "included"
+        patch_rows.append(f"| {name} | {delta_e:.3f} | {status} |")
+
     sections = [
         f"Reference: **{reference_name}**",
         f"White-balance patch: **{wb_patch_label}**",
         f"White-balance reference channel: **{wb_reference_channel} = 1.0**",
         f"Fit quality: **mean dE00 {result.mean_delta_e:.3f}**, **max dE00 {result.max_delta_e:.3f}**",
+        f"Excluded clipped patches: **{', '.join(excluded) if excluded else 'none'}**",
         "",
         format_vector_markdown("White Balance Vector", result.wb_vector),
+        "",
+        "### Siril commands: separate WB then CCM",
+        "",
+        "```text",
+        format_siril_ccm(np.diag(result.wb_vector)),
+        format_siril_ccm(result.siril_matrix_after_wb),
+        "```",
+        "",
+        "### Siril command: one-step WB plus CCM",
+        "",
+        "```text",
+        format_siril_ccm(result.siril_matrix_one_step),
+        "```",
         "",
         format_matrix_markdown(
             "Siril-Ready Matrix After White Balance (white-balanced RGB -> linear sRGB-like RGB)",
@@ -813,15 +931,14 @@ def format_output_markdown(
         "",
         format_matrix_markdown("Combined Matrix (raw RGB -> XYZ D50)", result.combined_matrix),
         "",
+        "\n".join(patch_rows),
+        "",
         (
             "Use **either** the Siril-ready matrix after white balance **or** the Siril-ready one-step matrix. "
             "Do not white-balance first and then also use the one-step matrix."
         ),
-        (
-            f"The Siril-ready matrices are brightness-scaled by the selected WB patch {wb_reference_channel} value "
-            f"(`{result.siril_output_scale:.3f}`) so the coefficients stay practical for Siril's GUI."
-        ),
-        "The intermediate XYZ matrices are still included for reference. Combined XYZ is `Forward × diag(WB)`.",
+        "Samples are normalized to Neutral 5 after WB, and the forward matrix is normalized so its Y-row sums to 1.",
+        "No gray-patch brightness scale is baked into the Siril matrices. Combined XYZ is `Forward × diag(WB)`.",
     ]
     if result.optimization_note:
         sections.extend(["", f"> {result.optimization_note}"])
@@ -1348,6 +1465,7 @@ class ForwardMatrixGUI(QMainWindow):
 
         self.reference_combo = QComboBox()
         self.reference_combo.addItems(["After Nov 2014", "Before Nov 2014"])
+        self.reference_combo.setCurrentText(DEFAULT_REFERENCE_NAME)
         options_layout.addWidget(QLabel("Reference Data:"), 0, 0)
         options_layout.addWidget(self.reference_combo, 0, 1)
 
@@ -1360,7 +1478,7 @@ class ForwardMatrixGUI(QMainWindow):
 
         self.wb_patch_combo = QComboBox()
         self.wb_patch_combo.addItems(WB_PATCH_LABELS)
-        self.wb_patch_combo.setCurrentText("Neutral 6.5")
+        self.wb_patch_combo.setCurrentText(DEFAULT_WB_PATCH_LABEL)
         options_layout.addWidget(QLabel("WB Patch:"), 1, 0)
         options_layout.addWidget(self.wb_patch_combo, 1, 1)
 
@@ -1503,7 +1621,7 @@ class ForwardMatrixGUI(QMainWindow):
         """Match the preview grid to the apparent chart orientation."""
         orientation = self.orientation_value()
         self.preview_widget.set_orientation(orientation)
-        if orientation in (0, 2):
+        if orientation % 4 in (0, 2):
             self.preview_widget.set_grid_shape(6, 4)
         else:
             self.preview_widget.set_grid_shape(4, 6)
@@ -1559,14 +1677,26 @@ class ForwardMatrixGUI(QMainWindow):
 
         try:
             crop_rgb = crop_array(self.loaded_image.rgb, crop_rect)
-            sampled_rgb = sample_colorchecker_patches(crop_rgb, self.orientation_value(), self.patch_sample_fraction())
+            sampling = sample_colorchecker_patches(
+                crop_rgb,
+                self.orientation_value(),
+                self.patch_sample_fraction(),
+                clipping_value=self.loaded_image.clipping_value,
+                return_details=True,
+            )
+            assert isinstance(sampling, PatchSamplingResult)
+            sampled_rgb = sampling.rgb
             wb_patch_index = self.selected_wb_patch_index()
+            if not sampling.included_mask[wb_patch_index]:
+                raise ValueError(f"The selected WB patch {PATCH_NAMES[wb_patch_index]} is clipped")
             wb_reference_channel = self.selected_wb_reference_channel()
-            wb_reference_index = WB_REFERENCE_CHANNELS[wb_reference_channel]
             wb_vector = white_balance_from_patch(sampled_rgb[wb_patch_index], wb_reference_channel)
-            wb_reference_rgb = sampled_rgb[wb_patch_index] * wb_vector
-            siril_output_scale = float(wb_reference_rgb[wb_reference_index])
-            result = solve_forward_matrix(sampled_rgb, self.selected_reference_lab(), wb_vector, siril_output_scale)
+            result = solve_forward_matrix(
+                sampled_rgb,
+                self.selected_reference_lab(),
+                wb_vector,
+                included_mask=sampling.included_mask,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Computation Error", str(exc))
             return
